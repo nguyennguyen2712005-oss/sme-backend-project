@@ -15,22 +15,18 @@ import sme.backend.repository.*;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.Instant;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 
 /**
- * POSService - Checkout Engine
+ * POSService — Final version với đầy đủ:
+ *  [FIX-1] Ngăn double refund
+ *  [FIX-2] Inventory transaction dùng invoiceId thực
+ *  [FIX-8] Refund kiểm tra warehouse
+ *  [NEW]   Tích hợp Mã Khuyến mãi (Promotion)
  *
- * Xử lý toàn bộ luồng thanh toán POS theo thứ tự ACID:
- * 1. Validate shift đang mở
- * 2. Validate tồn kho từng sản phẩm
- * 3. Tính discount + điểm
- * 4. Trừ kho (Optimistic Lock)
- * 5. Tạo Invoice + InvoiceItems + InvoicePayments
- * 6. Ghi Cashbook transactions
- * 7. Cộng điểm khách hàng
- * 8. Return InvoiceResponse để Frontend in hóa đơn
+ * Thứ tự ưu tiên discount:
+ *   1. Mã khuyến mãi (promotionCode) — áp dụng trước
+ *   2. Điểm tích lũy (pointsToUse)  — áp dụng sau, tính trên giá còn lại
  */
 @Service
 @RequiredArgsConstructor
@@ -40,15 +36,16 @@ public class POSService {
     private final ShiftService shiftService;
     private final InventoryService inventoryService;
     private final InventoryRepository inventoryRepository;
-    private final InventoryTransactionRepository inventoryTransactionRepository;
     private final InvoiceRepository invoiceRepository;
     private final CustomerRepository customerRepository;
     private final ProductRepository productRepository;
     private final CashbookTransactionRepository cashbookRepository;
     private final AppProperties appProperties;
+    private final PromotionService promotionService; // [NEW]
+    private final CodeGeneratorService codeGenerator; // [FIX-7] PostgreSQL sequence, tránh trùng mã khi concurrent
 
     // ─────────────────────────────────────────────────────────
-    // CHECKOUT (POS-04, POS-05) — toàn bộ là 1 transaction ACID
+    // CHECKOUT
     // ─────────────────────────────────────────────────────────
     @Transactional
     public InvoiceResponse checkout(CheckoutRequest req, UUID cashierId, UUID warehouseId) {
@@ -64,24 +61,11 @@ public class POSService {
         Customer customer = null;
         if (req.getCustomerId() != null) {
             customer = customerRepository.findById(req.getCustomerId())
-                    .orElseThrow(() -> new ResourceNotFoundException("Customer", req.getCustomerId()));
+                    .orElseThrow(() -> new ResourceNotFoundException(
+                            "Customer", req.getCustomerId()));
         }
 
-        // 3. Build invoice
-        String code = generateInvoiceCode();
-        Invoice invoice = Invoice.builder()
-                .code(code)
-                .shiftId(shift.getId())
-                .customerId(customer != null ? customer.getId() : null)
-                .type(Invoice.InvoiceType.SALE)
-                .cashierId(cashierId)
-                .note(req.getNote())
-                .build();
-
-        // 4. Xử lý từng sản phẩm: validate tồn kho + tạo InvoiceItem
-        BigDecimal totalAmount = BigDecimal.ZERO;
-
-        // Validate tồn kho trước – không trừ vội, tránh partial rollback
+        // 3. Validate tồn kho TOÀN BỘ trước — Pessimistic Lock, chưa trừ
         for (CheckoutRequest.CartItemRequest cartItem : req.getItems()) {
             productRepository.findById(cartItem.getProductId())
                     .orElseThrow(() -> new ResourceNotFoundException(
@@ -89,70 +73,56 @@ public class POSService {
             Inventory inv = inventoryRepository
                     .findByProductAndWarehouseWithLock(cartItem.getProductId(), warehouseId)
                     .orElseThrow(() -> new InsufficientStockException(
-                            "Không tìm thấy tồn kho cho sản phẩm: " + cartItem.getProductId()));
+                            "Không tìm thấy tồn kho cho sản phẩm " + cartItem.getProductId()));
             if (inv.getAvailableQuantity() < cartItem.getQuantity()) {
                 throw new InsufficientStockException(
                         "Sản phẩm không đủ hàng. Khả dụng: " + inv.getAvailableQuantity());
             }
         }
 
-        for (CheckoutRequest.CartItemRequest cartItem : req.getItems()) {
-            Product product = productRepository.findById(cartItem.getProductId()).orElseThrow();
-            Inventory inv = inventoryRepository
-                    .findByProductAndWarehouseWithLock(product.getId(), warehouseId)
-                    .orElseThrow();
-            int before = inv.getQuantity();
-            inv.deductPhysicalQuantity(cartItem.getQuantity());
-            inventoryRepository.save(inv);
-            // Thẻ kho sẽ được ghi sau khi có invoiceId – dùng UUID temp
-            inventoryTransactionRepository.save(
-                    InventoryTransaction.builder()
-                            .inventoryId(inv.getId())
-                            .referenceId(UUID.randomUUID()) // will be updated post-save
-                            .transactionType("SALE_POS")
-                            .quantityChange(-cartItem.getQuantity())
-                            .quantityBefore(before)
-                            .quantityAfter(inv.getQuantity())
-                            .createdBy(cashierId.toString())
-                            .build()
-            );
+        // 4. Tính tổng tiền trước discount
+        BigDecimal totalAmount = req.getItems().stream()
+                .map(item -> item.getUnitPrice()
+                        .multiply(BigDecimal.valueOf(item.getQuantity())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-            InvoiceItem item = InvoiceItem.builder()
-                    .productId(product.getId())
-                    .quantity(cartItem.getQuantity())
-                    .unitPrice(cartItem.getUnitPrice())
-                    .macPrice(product.getMacPrice())
-                    .subtotal(cartItem.getUnitPrice()
-                            .multiply(BigDecimal.valueOf(cartItem.getQuantity())))
-                    .build();
-            invoice.addItem(item);
-            totalAmount = totalAmount.add(item.getSubtotal());
+        // ── TÍNH DISCOUNT (Promotions + Loyalty Points) ──────
+        BigDecimal promotionDiscount = BigDecimal.ZERO;
+        BigDecimal loyaltyDiscount   = BigDecimal.ZERO;
+        int pointsToUse = req.getPointsToUse() != null ? req.getPointsToUse() : 0;
+        String promotionCode = req.getPromotionCode();
+
+        // A. [NEW] Mã khuyến mãi (ưu tiên 1)
+        if (promotionCode != null && !promotionCode.isBlank()) {
+            // applyPromotion() vừa validate vừa tăng usedCount (atomic via @Modifying)
+            promotionDiscount = promotionService.applyPromotion(
+                    promotionCode.trim(), totalAmount, "POS");
         }
 
-        // 5. Tính discount (điểm đổi thưởng)
-        BigDecimal discountAmount = BigDecimal.ZERO;
-        int pointsToUse = req.getPointsToUse() != null ? req.getPointsToUse() : 0;
+        // B. Điểm tích lũy (ưu tiên 2 — tính trên giá sau mã KM)
+        BigDecimal afterPromotion = totalAmount.subtract(promotionDiscount);
         if (pointsToUse > 0 && customer != null) {
             if (pointsToUse % 500 != 0) {
-                throw new BusinessException("INVALID_POINTS", "Chỉ có thể quy đổi điểm theo mốc voucher 500 điểm.");
+                throw new BusinessException("INVALID_POINTS",
+                        "Chỉ có thể quy đổi điểm theo mốc 500 điểm.");
             }
-            customer.deductPoints(pointsToUse); 
-            
-            // SỬ DỤNG BIẾN REDEEM VALUE MỚI (1 điểm = 100đ)
-            discountAmount = BigDecimal.valueOf(pointsToUse)
+            if (customer.getLoyaltyPoints() < pointsToUse) {
+                throw new BusinessException("INSUFFICIENT_POINTS",
+                        "Điểm tích lũy không đủ. Hiện có: " + customer.getLoyaltyPoints());
+            }
+            loyaltyDiscount = BigDecimal.valueOf(pointsToUse)
                     .multiply(BigDecimal.valueOf(
                             appProperties.getBusiness().getLoyaltyPointsRedeemValue()));
-            if (discountAmount.compareTo(totalAmount) > 0) {
-                discountAmount = totalAmount; // không giảm quá tổng bill
+            if (loyaltyDiscount.compareTo(afterPromotion) > 0) {
+                loyaltyDiscount = afterPromotion;
             }
         }
 
-        BigDecimal finalAmount = totalAmount.subtract(discountAmount);
-        invoice.setTotalAmount(totalAmount);
-        invoice.setDiscountAmount(discountAmount);
-        invoice.setFinalAmount(finalAmount);
+        BigDecimal discountAmount = promotionDiscount.add(loyaltyDiscount);
+        BigDecimal finalAmount    = totalAmount.subtract(discountAmount);
+        // ─────────────────────────────────────────────────────
 
-        // 6. Validate tổng tiền thanh toán = finalAmount
+        // 5. Validate tổng tiền thanh toán
         BigDecimal totalPaid = req.getPayments().stream()
                 .map(CheckoutRequest.PaymentRequest::getAmount)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
@@ -162,28 +132,67 @@ public class POSService {
                             totalPaid, finalAmount));
         }
 
-        // 7. Tạo InvoicePayments + ghi Cashbook
+        // 6. Build Invoice
+        String invoiceNote = buildNote(req.getNote(), promotionCode, pointsToUse);
+        Invoice invoice = Invoice.builder()
+                .code(codeGenerator.nextInvoiceCode()) // [FIX-7]
+                .shiftId(shift.getId())
+                .customerId(customer != null ? customer.getId() : null)
+                .type(Invoice.InvoiceType.SALE)
+                .cashierId(cashierId)
+                .totalAmount(totalAmount)
+                .discountAmount(discountAmount)
+                .finalAmount(finalAmount)
+                .pointsUsed(pointsToUse)
+                .note(invoiceNote)
+                .build();
+
+        for (CheckoutRequest.CartItemRequest cartItem : req.getItems()) {
+            Product product = productRepository.findById(cartItem.getProductId()).orElseThrow();
+            invoice.addItem(InvoiceItem.builder()
+                    .productId(product.getId())
+                    .quantity(cartItem.getQuantity())
+                    .unitPrice(cartItem.getUnitPrice())
+                    .macPrice(product.getMacPrice())
+                    .subtotal(cartItem.getUnitPrice()
+                            .multiply(BigDecimal.valueOf(cartItem.getQuantity())))
+                    .build());
+        }
+
         for (CheckoutRequest.PaymentRequest p : req.getPayments()) {
             InvoicePayment.PaymentMethod method;
             try {
                 method = InvoicePayment.PaymentMethod.valueOf(p.getMethod().toUpperCase());
             } catch (IllegalArgumentException e) {
                 throw new BusinessException("INVALID_PAYMENT_METHOD",
-                        "Phương thức thanh toán không hợp lệ: " + p.getMethod());
+                        "Phương thức không hợp lệ: " + p.getMethod());
             }
-
-            InvoicePayment payment = InvoicePayment.builder()
-                    .method(method)
-                    .amount(p.getAmount())
-                    .reference(p.getReference())
-                    .build();
-            invoice.addPayment(payment);
-
-            // Ghi Sổ quỹ (Cashbook) cho từng phương thức
-            recordCashbook(shift, method, p.getAmount(), warehouseId);
+            invoice.addPayment(InvoicePayment.builder()
+                    .method(method).amount(p.getAmount()).reference(p.getReference()).build());
         }
 
-        // 8. Cộng điểm tích lũy
+        // [FIX-2] Lưu Invoice TRƯỚC để có invoiceId thực
+        invoice = invoiceRepository.save(invoice);
+        final UUID invoiceId = invoice.getId();
+
+        // 7. Trừ kho với invoiceId chính xác
+        for (CheckoutRequest.CartItemRequest cartItem : req.getItems()) {
+            inventoryService.deductForPOSSale(
+                    cartItem.getProductId(), warehouseId,
+                    cartItem.getQuantity(), invoiceId, cashierId.toString());
+        }
+
+        // 8. Trừ điểm sau khi invoice đã confirm thành công
+        if (pointsToUse > 0 && customer != null) {
+            customer.deductPoints(pointsToUse);
+        }
+
+        // 9. Ghi Sổ quỹ
+        for (InvoicePayment p : invoice.getPayments()) {
+            recordCashbook(shift, p.getMethod(), p.getAmount(), warehouseId);
+        }
+
+        // 10. Cộng điểm tích lũy
         int pointsEarned = 0;
         if (customer != null) {
             pointsEarned = finalAmount.divide(
@@ -192,41 +201,63 @@ public class POSService {
             customer.addPoints(pointsEarned);
             customer.setTotalSpent(customer.getTotalSpent().add(finalAmount));
             customerRepository.save(customer);
+            invoice.setPointsEarned(pointsEarned);
+            invoice = invoiceRepository.save(invoice);
         }
-        invoice.setPointsUsed(pointsToUse);
-        invoice.setPointsEarned(pointsEarned);
 
-        // 9. Lưu Invoice (cascade lưu items + payments)
-        invoice = invoiceRepository.save(invoice);
-
-        // 10. Cập nhật referenceId cho InventoryTransactions (bổ sung invoice ID)
-        // (đây là post-save update, production có thể dùng event)
-
-        log.info("Checkout completed: invoice={}, amount={}, cashier={}",
-                invoice.getCode(), finalAmount, cashierId);
-
+        log.info("Checkout OK: invoice={}, total={}, discount={} (promo={}/points={}), cashier={}",
+                invoice.getCode(), totalAmount, discountAmount, promotionDiscount, loyaltyDiscount, cashierId);
         return buildInvoiceResponse(invoice);
     }
 
     // ─────────────────────────────────────────────────────────
-    // TRẢ HÀNG (POS-07, POS-08)
+    // REFUND — giữ nguyên từ Step 1 fix
     // ─────────────────────────────────────────────────────────
     @Transactional
     public InvoiceResponse refund(UUID originalInvoiceId, UUID shiftId,
                                   List<RefundItem> items, String returnDestination,
                                   UUID cashierId, UUID warehouseId, String note) {
 
+        if (!invoiceRepository.existsByIdAndWarehouseId(originalInvoiceId, warehouseId)) {
+            throw new BusinessException("ACCESS_DENIED",
+                    "Hóa đơn này không thuộc chi nhánh của bạn.");
+        }
         Invoice original = invoiceRepository.findByIdWithDetails(originalInvoiceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Invoice", originalInvoiceId));
-
         if (original.getType() != Invoice.InvoiceType.SALE) {
             throw new BusinessException("INVALID_REFUND",
-                    "Không thể trả hàng cho hóa đơn trả hàng");
+                    "Không thể tạo trả hàng cho hóa đơn trả hàng");
         }
 
-        String code = generateReturnCode();
+        // [FIX-1] Double refund check
+        List<Invoice> existingReturns = invoiceRepository
+                .findReturnInvoicesWithItemsByReturnOfId(originalInvoiceId);
+        Map<UUID, Integer> alreadyReturnedQty = new HashMap<>();
+        for (Invoice ret : existingReturns) {
+            for (InvoiceItem ri : ret.getItems()) {
+                alreadyReturnedQty.merge(ri.getProductId(), Math.abs(ri.getQuantity()), Integer::sum);
+            }
+        }
+
+        for (RefundItem ri : items) {
+            InvoiceItem originalItem = original.getItems().stream()
+                    .filter(i -> i.getProductId().equals(ri.productId()))
+                    .findFirst()
+                    .orElseThrow(() -> new BusinessException("PRODUCT_NOT_IN_INVOICE",
+                            "Sản phẩm không có trong hóa đơn gốc: " + ri.productId()));
+            int alreadyReturned = alreadyReturnedQty.getOrDefault(ri.productId(), 0);
+            int remaining = originalItem.getQuantity() - alreadyReturned;
+            if (ri.quantity() <= 0) throw new BusinessException("INVALID_RETURN_QTY", "Số lượng hoàn phải > 0");
+            if (ri.quantity() > remaining) {
+                throw new BusinessException("EXCESSIVE_RETURN",
+                        String.format("Sản phẩm %s: đã hoàn %d/%d. Còn lại tối đa %d.",
+                                ri.productId(), alreadyReturned, originalItem.getQuantity(), remaining));
+            }
+        }
+
+        // Phase 1: Build return invoice
         Invoice returnInvoice = Invoice.builder()
-                .code(code)
+                .code(codeGenerator.nextReturnCode()) // [FIX-7]
                 .shiftId(shiftId)
                 .customerId(original.getCustomerId())
                 .type(Invoice.InvoiceType.RETURN)
@@ -236,55 +267,49 @@ public class POSService {
                 .build();
 
         BigDecimal totalRefund = BigDecimal.ZERO;
+        List<UUID>    productIds = new ArrayList<>();
+        List<Integer> quantities = new ArrayList<>();
 
         for (RefundItem ri : items) {
-            // Validate sản phẩm tồn tại trong hóa đơn gốc
-            InvoiceItem originalItem = original.getItems().stream()
-                    .filter(i -> i.getProductId().equals(ri.productId()))
-                    .findFirst()
-                    .orElseThrow(() -> new BusinessException("PRODUCT_NOT_IN_INVOICE",
-                            "Sản phẩm không có trong hóa đơn gốc: " + ri.productId()));
-
-            if (ri.quantity() > originalItem.getQuantity()) {
-                throw new BusinessException("EXCESSIVE_RETURN",
-                        "Số lượng trả vượt quá số lượng đã mua");
-            }
-
-            // Tạo item trả hàng với quantity âm
-            InvoiceItem returnItem = InvoiceItem.builder()
-                    .productId(ri.productId())
-                    .quantity(-ri.quantity())     // SỐ ÂM
-                    .unitPrice(originalItem.getUnitPrice())
-                    .macPrice(originalItem.getMacPrice())
-                    .subtotal(originalItem.getUnitPrice().multiply(BigDecimal.valueOf(-ri.quantity())))
-                    .build();
-            returnInvoice.addItem(returnItem);
-            totalRefund = totalRefund.add(originalItem.getUnitPrice()
-                    .multiply(BigDecimal.valueOf(ri.quantity())));
-
-            // Hoàn kho
-            inventoryService.returnToStock(ri.productId(), warehouseId,
-                    ri.quantity(), null, returnDestination, cashierId.toString());
+            InvoiceItem oi = original.getItems().stream()
+                    .filter(i -> i.getProductId().equals(ri.productId())).findFirst().orElseThrow();
+            returnInvoice.addItem(InvoiceItem.builder()
+                    .productId(ri.productId()).quantity(-ri.quantity())
+                    .unitPrice(oi.getUnitPrice()).macPrice(oi.getMacPrice())
+                    .subtotal(oi.getUnitPrice().multiply(BigDecimal.valueOf(-ri.quantity())))
+                    .build());
+            totalRefund = totalRefund.add(oi.getUnitPrice().multiply(BigDecimal.valueOf(ri.quantity())));
+            productIds.add(ri.productId());
+            quantities.add(ri.quantity());
         }
-
         returnInvoice.setTotalAmount(totalRefund);
         returnInvoice.setFinalAmount(totalRefund);
 
-        // Sinh Phiếu Chi từ Sổ quỹ
+        // [FIX-REFUND-REF] Lưu trước để lấy returnInvoiceId thực
+        returnInvoice = invoiceRepository.save(returnInvoice);
+        final UUID returnInvoiceId = returnInvoice.getId();
+
+        // Phase 2: Hoàn kho
+        for (int i = 0; i < productIds.size(); i++) {
+            inventoryService.returnToStock(productIds.get(i), warehouseId, quantities.get(i),
+                    returnInvoiceId,
+                    (returnDestination != null) ? returnDestination : "STOCK",
+                    cashierId.toString());
+        }
+
+        // Phase 3: Phiếu Chi Sổ quỹ
         Shift shift = shiftService.getOpenShiftByCashier(cashierId);
-        CashbookTransaction refundTxn = CashbookTransaction.builder()
-                .warehouseId(warehouseId)
-                .shiftId(shift.getId())
+        cashbookRepository.save(CashbookTransaction.builder()
+                .warehouseId(warehouseId).shiftId(shift.getId())
                 .fundType(CashbookTransaction.FundType.CASH_111)
                 .transactionType(CashbookTransaction.TransactionType.OUT)
-                .referenceType("INVOICE")
+                .referenceType("INVOICE").referenceId(returnInvoiceId)
                 .amount(totalRefund)
                 .description("Trả hàng hóa đơn #" + original.getCode())
-                .createdBy(cashierId.toString())
-                .build();
-        cashbookRepository.save(refundTxn);
+                .createdBy(cashierId.toString()).build());
 
-        returnInvoice = invoiceRepository.save(returnInvoice);
+        log.info("Refund OK: return={}, original={}, amount={}",
+                returnInvoice.getCode(), original.getCode(), totalRefund);
         return buildInvoiceResponse(returnInvoice);
     }
 
@@ -297,63 +322,45 @@ public class POSService {
                 method == InvoicePayment.PaymentMethod.CASH
                         ? CashbookTransaction.FundType.CASH_111
                         : CashbookTransaction.FundType.BANK_112;
-
-        CashbookTransaction txn = CashbookTransaction.builder()
-                .warehouseId(warehouseId)
-                .shiftId(shift.getId())
+        cashbookRepository.save(CashbookTransaction.builder()
+                .warehouseId(warehouseId).shiftId(shift.getId())
                 .fundType(fundType)
                 .transactionType(CashbookTransaction.TransactionType.IN)
-                .referenceType("INVOICE")
-                .amount(amount)
+                .referenceType("INVOICE").amount(amount)
                 .description("Thu tiền bán hàng - " + method.name())
-                .createdBy(shift.getCashierId().toString())
-                .build();
-        cashbookRepository.save(txn);
+                .createdBy(shift.getCashierId().toString()).build());
     }
 
-    private String generateInvoiceCode() {
-        return "INV-" + System.currentTimeMillis();
-    }
-
-    private String generateReturnCode() {
-        return "RET-" + System.currentTimeMillis();
+    private String buildNote(String baseNote, String promotionCode, int pointsUsed) {
+        StringBuilder sb = new StringBuilder();
+        if (promotionCode != null && !promotionCode.isBlank()) {
+            sb.append("[Mã KM: ").append(promotionCode.toUpperCase()).append("] ");
+        }
+        if (pointsUsed > 0) {
+            sb.append("[Đổi ").append(pointsUsed).append(" điểm] ");
+        }
+        if (baseNote != null && !baseNote.isBlank()) sb.append(baseNote);
+        return sb.toString().trim();
     }
 
     private InvoiceResponse buildInvoiceResponse(Invoice invoice) {
-        List<InvoiceResponse.ItemResponse> items = invoice.getItems().stream()
-                .map(i -> InvoiceResponse.ItemResponse.builder()
-                        .productId(i.getProductId())
-                        .quantity(i.getQuantity())
-                        .unitPrice(i.getUnitPrice())
-                        .macPrice(i.getMacPrice())
-                        .subtotal(i.getSubtotal())
-                        .build())
-                .toList();
-
-        List<InvoiceResponse.PaymentResponse> payments = invoice.getPayments().stream()
-                .map(p -> InvoiceResponse.PaymentResponse.builder()
-                        .method(p.getMethod().name())
-                        .amount(p.getAmount())
-                        .reference(p.getReference())
-                        .build())
-                .toList();
-
+        List<InvoiceResponse.ItemResponse> items = invoice.getItems() == null ? List.of()
+                : invoice.getItems().stream().map(i -> InvoiceResponse.ItemResponse.builder()
+                        .productId(i.getProductId()).quantity(i.getQuantity())
+                        .unitPrice(i.getUnitPrice()).macPrice(i.getMacPrice())
+                        .subtotal(i.getSubtotal()).build()).toList();
+        List<InvoiceResponse.PaymentResponse> payments = invoice.getPayments() == null ? List.of()
+                : invoice.getPayments().stream().map(p -> InvoiceResponse.PaymentResponse.builder()
+                        .method(p.getMethod().name()).amount(p.getAmount())
+                        .reference(p.getReference()).build()).toList();
         return InvoiceResponse.builder()
-                .id(invoice.getId())
-                .code(invoice.getCode())
-                .shiftId(invoice.getShiftId())
-                .customerId(invoice.getCustomerId())
-                .type(invoice.getType().name())
-                .totalAmount(invoice.getTotalAmount())
-                .discountAmount(invoice.getDiscountAmount())
-                .finalAmount(invoice.getFinalAmount())
-                .pointsUsed(invoice.getPointsUsed())
-                .pointsEarned(invoice.getPointsEarned())
-                .note(invoice.getNote())
-                .createdAt(invoice.getCreatedAt())
-                .items(items)
-                .payments(payments)
-                .build();
+                .id(invoice.getId()).code(invoice.getCode())
+                .shiftId(invoice.getShiftId()).customerId(invoice.getCustomerId())
+                .returnOfId(invoice.getReturnOfId()).type(invoice.getType().name())
+                .totalAmount(invoice.getTotalAmount()).discountAmount(invoice.getDiscountAmount())
+                .finalAmount(invoice.getFinalAmount()).pointsUsed(invoice.getPointsUsed())
+                .pointsEarned(invoice.getPointsEarned()).note(invoice.getNote())
+                .createdAt(invoice.getCreatedAt()).items(items).payments(payments).build();
     }
 
     public record RefundItem(UUID productId, int quantity) {}

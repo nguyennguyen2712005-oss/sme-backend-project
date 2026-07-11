@@ -79,6 +79,24 @@ spring:
       initialize-schema: always  # Tạo schema batch tự động
 
   # ========================
+  # EMAIL (MỚI THÊM)
+  # ========================
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+
+  # ========================
   # SPRING AI - Dùng Gemini qua chuẩn OpenAI
   # ========================
   ai:
@@ -107,9 +125,9 @@ cloudinary:
   api-key: ${CLOUDINARY_API_KEY:}
   api-secret: ${CLOUDINARY_API_SECRET:}
 
-  # ========================
-  # WEBSOCKET (STOMP)
-  # ========================
+# ========================
+# WEBSOCKET (STOMP)
+# ========================
 websocket:
   message-broker:
     application-destination-prefix: /app
@@ -161,6 +179,13 @@ app:
     chunk-size: 800
     chunk-overlap: 100
     top-k-results: 5
+
+  # QUÊN MẬT KHẨU (MỚI THÊM)
+  frontend-url: ${FRONTEND_URL:http://localhost:5173}
+  mail:
+    sender-name: "SME ERP & POS"
+  password-reset:
+    token-ttl-minutes: 15
 
 # ========================
 # LOGGING

@@ -1,3 +1,4 @@
+
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -213,7 +214,9 @@ public class FinanceService {
 
     @Transactional(readOnly = true)
     public List<SupplierDebtResponse> getOutstandingDebts(UUID warehouseId) {
-        List<SupplierDebt> debts = supplierDebtRepository.findOutstandingDebtsByWarehouse(warehouseId);
+        List<SupplierDebt> debts = (warehouseId == null) 
+                ? supplierDebtRepository.findAllOutstandingDebts() 
+                : supplierDebtRepository.findOutstandingDebtsByWarehouse(warehouseId);
 
         return debts.stream().map(debt -> {
             var po = purchaseOrderRepository.findById(debt.getPurchaseOrderId()).orElse(null);
@@ -244,11 +247,19 @@ public class FinanceService {
                     .build();
         }).toList();
     }
+    
 
-    // ĐÃ BỔ SUNG: Tính tổng công nợ của một Nhà cung cấp
+// ĐÃ SỬA: Tính tổng công nợ của một Nhà cung cấp (Có phân quyền theo kho)
     @Transactional(readOnly = true)
-    public BigDecimal getTotalOutstandingBySupplier(UUID supplierId) {
-        BigDecimal total = supplierDebtRepository.getTotalOutstandingBySupplierId(supplierId);
+    public BigDecimal getTotalOutstandingBySupplier(UUID supplierId, UUID warehouseId) {
+        BigDecimal total;
+        if (warehouseId == null) {
+            // Dành cho Admin: Lấy tổng nợ toàn chuỗi
+            total = supplierDebtRepository.getTotalOutstandingBySupplierId(supplierId);
+        } else {
+            // Dành cho Manager: Lấy tổng nợ của riêng chi nhánh
+            total = supplierDebtRepository.getTotalOutstandingBySupplierAndWarehouse(supplierId, warehouseId);
+        }
         return total != null ? total : BigDecimal.ZERO;
     }
 

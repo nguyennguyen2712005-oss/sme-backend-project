@@ -2,6 +2,9 @@ package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
@@ -11,7 +14,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import sme.backend.dto.request.ChangePasswordRequest;
 import sme.backend.dto.request.CreateUserRequest;
+import sme.backend.dto.request.ForgotPasswordRequest;
 import sme.backend.dto.request.LoginRequest;
+import sme.backend.dto.request.ResetPasswordRequest;
 import sme.backend.dto.response.AuthResponse;
 import sme.backend.dto.response.UserResponse;
 import sme.backend.entity.User;
@@ -22,8 +27,8 @@ import sme.backend.repository.UserRepository;
 import sme.backend.repository.WarehouseRepository;
 import sme.backend.security.UserPrincipal;
 import sme.backend.security.jwt.JwtTokenProvider;
-import org.springframework.data.domain.Sort;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -38,6 +43,16 @@ public class AuthService {
     private final UserRepository userRepository;
     private final WarehouseRepository warehouseRepository;
     private final PasswordEncoder passwordEncoder;
+    
+    // [MỚI THÊM] Inject EmailService và RedisTemplate
+    private final EmailService emailService;
+    private final StringRedisTemplate stringRedisTemplate;
+
+    @Value("${app.frontend-url}")
+    private String frontendUrl;
+
+    private static final String RESET_TOKEN_PREFIX = "pwd-reset:";
+    private static final String RESET_COOLDOWN_PREFIX = "pwd-reset-cooldown:";
 
     // ─────────────────────────────────────────────────────────
     // LOGIN
@@ -163,7 +178,6 @@ public class AuthService {
         if (req.getRole() != null) user.setRole(User.UserRole.valueOf(req.getRole()));
         if (req.getWarehouseId() != null) user.setWarehouseId(req.getWarehouseId());
         
-        // ĐÃ BỔ SUNG: Cập nhật cài đặt POS
         if (req.getPosSettings() != null) user.setPosSettings(req.getPosSettings());
 
         if (req.getPassword() != null && !req.getPassword().isBlank()) {
@@ -172,9 +186,6 @@ public class AuthService {
         
         return mapToResponse(userRepository.save(user));
     }
-
-    // Trong hàm mapToResponse thêm dòng này:
-    // .posSettings(user.getPosSettings())
 
     @Transactional
     public void changePassword(UUID userId, ChangePasswordRequest req) {
@@ -199,6 +210,56 @@ public class AuthService {
     public List<UserResponse> getAllUsers() {
         return userRepository.findAllActive().stream()
                 .map(this::mapToResponse).toList();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // QUÊN MẬT KHẨU (MỚI THÊM)
+    // ─────────────────────────────────────────────────────────
+    @Transactional(readOnly = true)
+    public void forgotPassword(String email) {
+        userRepository.findFirstByEmailIgnoreCaseAndIsActiveTrue(email).ifPresentOrElse(user -> {
+            String cooldownKey = RESET_COOLDOWN_PREFIX + user.getId();
+            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(cooldownKey))) {
+                log.info("Bỏ qua yêu cầu quên mật khẩu (đang trong cooldown) cho user: {}", user.getId());
+                return; // im lặng, không lộ thông tin, tránh spam gửi mail
+            }
+
+            String token = java.util.UUID.randomUUID().toString().replace("-", "")
+                    + java.util.UUID.randomUUID().toString().replace("-", "");
+
+            stringRedisTemplate.opsForValue()
+                    .set(RESET_TOKEN_PREFIX + token, user.getId().toString(), Duration.ofMinutes(15));
+            stringRedisTemplate.opsForValue()
+                    .set(cooldownKey, "1", Duration.ofSeconds(60));
+
+            String resetLink = frontendUrl + "/reset-password?token=" + token;
+            emailService.sendPasswordResetEmail(user.getEmail(), user.getFullName(), resetLink);
+
+            log.info("Đã tạo token đặt lại mật khẩu cho user: {}", user.getId());
+        }, () -> log.info("Yêu cầu quên mật khẩu cho email không tồn tại/không active: {}", email));
+
+        // Không throw exception, không phân biệt email tồn tại hay không —
+        // tránh lộ thông tin cho kẻ tấn công dò email hợp lệ trong hệ thống.
+    }
+
+    @Transactional
+    public void resetPassword(ResetPasswordRequest req) {
+        String redisKey = RESET_TOKEN_PREFIX + req.getToken();
+        String userIdStr = stringRedisTemplate.opsForValue().get(redisKey);
+
+        if (userIdStr == null) {
+            throw new BusinessException("INVALID_OR_EXPIRED_TOKEN",
+                    "Liên kết đặt lại mật khẩu không hợp lệ hoặc đã hết hạn");
+        }
+
+        User user = userRepository.findById(UUID.fromString(userIdStr))
+                .orElseThrow(() -> new ResourceNotFoundException("User", userIdStr));
+
+        user.setPasswordHash(passwordEncoder.encode(req.getNewPassword()));
+        userRepository.save(user);
+
+        stringRedisTemplate.delete(redisKey); // dùng 1 lần rồi xóa ngay
+        log.info("Đặt lại mật khẩu thành công cho user: {}", user.getId());
     }
 
     // ─────────────────────────────────────────────────────────

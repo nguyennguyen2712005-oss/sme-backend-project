@@ -1,3 +1,4 @@
+
 package sme.backend.controller;
 
 import lombok.RequiredArgsConstructor;
@@ -67,8 +68,12 @@ public class ReportController {
 
         UUID wid = getEffectiveWarehouseId(principal, warehouseId);
                 
-        return ResponseEntity.ok(ApiResponse.ok(
-                inventoryRepository.getInventoryValueReport(wid)));
+        // ĐÃ SỬA: Gọi hàm riêng biệt
+        if (wid == null) {
+            return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.getInventoryValueReportAll()));
+        } else {
+            return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.getInventoryValueReportByWarehouse(wid)));
+        }
     }
 
     @GetMapping("/dead-stock")
@@ -80,8 +85,12 @@ public class ReportController {
 
         UUID wid = getEffectiveWarehouseId(principal, warehouseId);
                 
-        return ResponseEntity.ok(ApiResponse.ok(
-                inventoryRepository.findDeadStockByWarehouse(wid, days)));
+        // ĐÃ SỬA: Gọi hàm riêng biệt
+        if (wid == null) {
+            return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.findDeadStockAll(days)));
+        } else {
+            return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.findDeadStockByWarehouse(wid, days)));
+        }
     }
 
     @GetMapping("/top-products")

@@ -1,3 +1,4 @@
+
 package sme.backend.repository;
 
 import org.springframework.data.domain.Page;
@@ -21,13 +22,13 @@ public interface CustomerRepository extends JpaRepository<Customer, UUID> {
 
     // ĐÃ NÂNG CẤP: Gộp cả tìm kiếm keyword và lọc theo hạng thẻ (tier) vào một Query linh hoạt
     @Query("SELECT c FROM Customer c WHERE c.isActive = true " +
-           "AND (:tier IS NULL OR c.customerTier = :tier) " +
+           "AND (:tier IS NULL OR CAST(c.customerTier AS string) = :tier) " +
            "AND (:kw IS NULL OR :kw = '' " +
            "OR LOWER(c.fullName) LIKE LOWER(CONCAT('%', :kw, '%')) " +
            "OR c.phoneNumber LIKE CONCAT('%', REPLACE(:kw, ' ', ''), '%') " +
            "OR LOWER(c.email) LIKE LOWER(CONCAT('%', :kw, '%')))")
     Page<Customer> searchWithFilters(@Param("kw") String keyword, 
-                                     @Param("tier") Customer.CustomerTier tier, 
+                                     @Param("tier") String tier, 
                                      Pageable pageable);
 
     // Top khách hàng theo tổng chi tiêu

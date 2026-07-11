@@ -1,3 +1,4 @@
+
 package sme.backend.config;
 
 import org.springframework.ai.chat.client.ChatClient;

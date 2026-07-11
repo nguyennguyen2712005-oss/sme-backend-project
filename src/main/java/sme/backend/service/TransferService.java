@@ -1,3 +1,4 @@
+
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -25,7 +26,8 @@ public class TransferService {
     private final InventoryRepository inventoryRepository;
     private final ProductRepository productRepository;
     private final NotificationService notificationService;
-    private final OrderRepository orderRepository; 
+    private final OrderRepository orderRepository;
+    private final CodeGeneratorService codeGenerator; // [FIX-7] PostgreSQL sequence, tránh trùng mã khi concurrent
 
     @Transactional
     public InternalTransfer createTransfer(UUID fromWarehouseId, UUID toWarehouseId,
@@ -45,7 +47,7 @@ public class TransferService {
         }
 
         InternalTransfer transfer = InternalTransfer.builder()
-                .code("TRF-" + System.currentTimeMillis())
+                .code(codeGenerator.nextTransferCode()) // [FIX-7]
                 .fromWarehouseId(fromWarehouseId)
                 .toWarehouseId(toWarehouseId)
                 .createdByUserId(createdBy)

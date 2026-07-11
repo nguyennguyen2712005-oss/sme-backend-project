@@ -1,3 +1,4 @@
+
 package sme.backend.config;
 
 import org.springframework.beans.factory.annotation.Value;

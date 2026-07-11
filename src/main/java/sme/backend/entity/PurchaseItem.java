@@ -1,3 +1,4 @@
+
 package sme.backend.entity;
 
 import com.fasterxml.jackson.annotation.JsonIgnore; // 1. Bổ sung import này

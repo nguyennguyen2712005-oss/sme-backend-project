@@ -1,3 +1,4 @@
+
 package sme.backend.controller;
 
 import lombok.RequiredArgsConstructor;
@@ -26,10 +27,15 @@ public class AiController {
     /**
      * POST /ai/chat — AI Co-pilot chat
      * Body: { "message": "...", "conversationHistory": "..." }
+     * ĐÃ SỬA: mở cho CASHIER (trước đây chỉ MANAGER, ADMIN). Nhớ là
+     * SecurityConfig cũng phải mở /ai/** cho CASHIER song song - sửa 1 trong 2
+     * chỗ là không đủ, request sẽ bị chặn ở filter chain trước khi tới đây.
+     * Response cũng đổi từ { reply } sang { reply, sources } để hiển thị được
+     * nguồn tài liệu AI đã dùng.
      */
     @PostMapping("/chat")
-    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
-    public ResponseEntity<ApiResponse<Map<String, String>>> chat(
+    @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> chat(
             @RequestBody Map<String, String> body,
             @AuthenticationPrincipal UserPrincipal principal) {
 
@@ -38,15 +44,26 @@ public class AiController {
 
         if (message == null || message.isBlank()) {
             return ResponseEntity.badRequest().body(
-                    ApiResponse.<Map<String, String>>builder()
+                    ApiResponse.<Map<String, Object>>builder()
                             .success(false).message("message bắt buộc").build());
         }
 
-        String reply = aiService.chat(message, principal.getId(), history);
-        return ResponseEntity.ok(ApiResponse.ok(Map.of("reply", reply)));
+        Map<String, Object> result = aiService.chat(message, principal.getId(), history);
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
+
+    /**
+     * GET /ai/suggested-questions — Câu hỏi gợi ý theo role (đọc role từ JWT)
+     */
+    @GetMapping("/suggested-questions")
+    @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
+    public ResponseEntity<ApiResponse<List<String>>> getSuggestedQuestions(
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(aiService.getSuggestedQuestions(principal.getRole())));
+    }
+
     @GetMapping("/documents")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<List<KnowledgeDocument>>> getAllDocuments() {
         return ResponseEntity.ok(ApiResponse.ok(aiService.getAllDocuments()));
     }
@@ -57,11 +74,13 @@ public class AiController {
         aiService.deleteDocument(id);
         return ResponseEntity.ok(ApiResponse.ok("Đã xóa tài liệu và làm sạch dữ liệu AI", null));
     }
+
     @GetMapping("/documents/{id}/chunks")
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ApiResponse<List<String>>> getDocumentChunks(@PathVariable UUID id) {
         return ResponseEntity.ok(ApiResponse.ok(aiService.getDocumentChunks(id)));
     }
+
     /**
      * POST /ai/documents — SYS-03: Upload tài liệu RAG
      * Hỗ trợ: PDF, DOCX, PPTX, TXT
@@ -75,7 +94,6 @@ public class AiController {
 
         String documentTitle = title != null ? title : file.getOriginalFilename();
 
-        // Convert MultipartFile to Spring Resource
         org.springframework.core.io.Resource resource =
                 new org.springframework.core.io.ByteArrayResource(file.getBytes()) {
                     @Override

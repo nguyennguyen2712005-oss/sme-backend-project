@@ -1,3 +1,4 @@
+
 package sme.backend.controller;
 
 import jakarta.validation.Valid;
@@ -82,6 +83,7 @@ public class FinanceController {
                 "total",    cash.add(bank)
         )));
     }
+    
 
     @GetMapping("/cashbook")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
@@ -111,9 +113,17 @@ public class FinanceController {
     @GetMapping("/supplier-debts/supplier/{supplierId}/total")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<BigDecimal>> getTotalOutstandingBySupplier(
-            @PathVariable UUID supplierId) {
+            @PathVariable UUID supplierId,
+            @AuthenticationPrincipal UserPrincipal principal,
+            @RequestParam(required = false) UUID warehouseId) {
+        
+        // Dùng hàm tiện ích có sẵn để ép quyền:
+        // Admin sẽ lấy warehouseId từ params (nếu có) hoặc null (toàn chuỗi)
+        // Manager bị ép buộc phải lấy warehouseId của chính họ
+        UUID wid = getEffectiveWarehouseId(principal, warehouseId);
+        
         return ResponseEntity.ok(ApiResponse.ok(
-                financeService.getTotalOutstandingBySupplier(supplierId)));
+                financeService.getTotalOutstandingBySupplier(supplierId, wid)));
     }
 
     @PostMapping("/supplier-debts/pay")

@@ -30,6 +30,8 @@ public interface UserRepository extends JpaRepository<User, UUID> {
            "AND u.role = 'ROLE_CASHIER' AND u.isActive = true")
     List<User> findActiveCashiersByWarehouse(@Param("wid") UUID warehouseId);
 
+    List<User> findByWarehouseIdAndRoleAndIsActiveTrue(UUID warehouseId, User.UserRole role);
 
-
+    // [MỚI THÊM] Tìm user theo email để gửi link quên mật khẩu
+    Optional<User> findFirstByEmailIgnoreCaseAndIsActiveTrue(String email);
 }

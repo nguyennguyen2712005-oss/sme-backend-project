@@ -8,6 +8,7 @@ import sme.backend.dto.request.CloseShiftRequest;
 import sme.backend.dto.request.OpenShiftRequest;
 import sme.backend.dto.response.ShiftResponse;
 import sme.backend.entity.Shift;
+import sme.backend.entity.User;
 import sme.backend.exception.BusinessException;
 import sme.backend.exception.ResourceNotFoundException;
 import sme.backend.repository.InvoiceRepository;
@@ -31,7 +32,6 @@ public class ShiftService {
     // ─────────────────────────────────────────────────────────
     @Transactional
     public ShiftResponse openShift(UUID cashierId, UUID warehouseId, OpenShiftRequest req) {
-        // Kiểm tra cashier đã có ca mở chưa
         if (shiftRepository.existsByCashierIdAndStatus(cashierId, Shift.ShiftStatus.OPEN)) {
             throw new BusinessException("SHIFT_ALREADY_OPEN",
                     "Thu ngân này đang có ca làm việc đang mở. Vui lòng đóng ca cũ trước.");
@@ -50,8 +50,7 @@ public class ShiftService {
     }
 
     // ─────────────────────────────────────────────────────────
-    // ĐÓNG CA MÙ (POS-B, Blind Close) (POS-09)
-    // Cashier KHÔNG biết số tiền lý thuyết khi đóng ca
+    // ĐÓNG CA MÙ (Blind Close)
     // ─────────────────────────────────────────────────────────
     @Transactional
     public ShiftResponse closeShift(UUID cashierId, CloseShiftRequest req) {
@@ -60,34 +59,56 @@ public class ShiftService {
                 .orElseThrow(() -> new BusinessException("NO_OPEN_SHIFT",
                         "Không tìm thấy ca làm việc đang mở cho thu ngân này"));
 
-        // Tính tiền lý thuyết: Đầu ca + Tiền mặt thu vào - Tiền mặt chi ra
         BigDecimal cashIn  = shiftRepository.sumCashInByShift(shift.getId());
         BigDecimal cashOut = shiftRepository.sumCashOutByShift(shift.getId());
-        BigDecimal theoretical = shift.getStartingCash().add(cashIn).subtract(cashOut);
+        if (cashIn == null)  cashIn  = BigDecimal.ZERO;
+        if (cashOut == null) cashOut = BigDecimal.ZERO;
 
-        // Gọi domain method (có validate lý do nếu lệch)
+        BigDecimal theoretical = shift.getStartingCash().add(cashIn).subtract(cashOut);
         shift.closeShift(req.getReportedCash(), theoretical, req.getDiscrepancyReason());
         shift = shiftRepository.save(shift);
 
-        // Notify Manager duyệt ca
         notificationService.notifyShiftClosed(shift);
         log.info("Shift closed: {} | theoretical={} | reported={} | discrepancy={}",
-                shift.getId(), theoretical, req.getReportedCash(),
-                shift.getDiscrepancyAmount());
+                shift.getId(), theoretical, req.getReportedCash(), shift.getDiscrepancyAmount());
+
+        // [FIX-3] mapToResponse được gọi ở đây — Controller sẽ mask theoreticalCash
+        // tuỳ theo role (xem POSController.closeShift).
         return mapToResponse(shift);
     }
 
     // ─────────────────────────────────────────────────────────
-    // DUYỆT CHỐT CA (Manager)
+    // DUYỆT CHỐT CA (Manager / Admin)
     // ─────────────────────────────────────────────────────────
+    /**
+     * [FIX-5] Thêm tham số managerWarehouseId để đảm bảo Manager chỉ duyệt
+     * ca của chi nhánh mình. Trước đây bất kỳ Manager nào cũng duyệt được
+     * bất kỳ ca nào nếu biết shiftId.
+     *
+     * @param shiftId             UUID ca cần duyệt
+     * @param managerId           UUID người duyệt
+     * @param approverWarehouseId warehouseId của người duyệt (null = ADMIN, không giới hạn)
+     * @param approverRole        Role của người duyệt
+     */
     @Transactional
-    public ShiftResponse approveShift(UUID shiftId, UUID managerId) {
+    public ShiftResponse approveShift(UUID shiftId, UUID managerId,
+                                       UUID approverWarehouseId, User.UserRole approverRole) {
         Shift shift = shiftRepository.findById(shiftId)
                 .orElseThrow(() -> new ResourceNotFoundException("Shift", shiftId));
 
+        // [FIX-5] Manager chỉ được duyệt ca của chi nhánh mình.
+        // Admin (warehouseId = null) không bị giới hạn.
+        if (approverRole == User.UserRole.ROLE_MANAGER) {
+            if (approverWarehouseId == null
+                    || !approverWarehouseId.equals(shift.getWarehouseId())) {
+                throw new BusinessException("ACCESS_DENIED",
+                        "Bạn chỉ có thể duyệt ca làm việc của chi nhánh mình.");
+            }
+        }
+
         shift.approve(managerId);
         shift = shiftRepository.save(shift);
-        log.info("Shift approved: {} by manager: {}", shiftId, managerId);
+        log.info("Shift approved: {} by: {} (role={})", shiftId, managerId, approverRole);
         return mapToResponse(shift);
     }
 
@@ -101,10 +122,25 @@ public class ShiftService {
                         "Thu ngân chưa mở ca. Vui lòng mở ca trước khi bán hàng."));
     }
 
+    /**
+     * [FIX-6] Trước đây hàm này gọi findByWarehouseIdAndStatus(null, CLOSED)
+     * khi Admin dùng → SQL WHERE warehouse_id = NULL luôn trả 0 rows. Admin không
+     * thấy được bất kỳ ca nào đang chờ duyệt.
+     *
+     * Giờ: warehouseId = null → Admin → dùng findAllByStatus() (không lọc kho).
+     */
     @Transactional(readOnly = true)
     public List<ShiftResponse> getPendingShifts(UUID warehouseId) {
-        return shiftRepository.findByWarehouseIdAndStatus(warehouseId, Shift.ShiftStatus.CLOSED)
-                .stream().map(this::mapToResponse).toList();
+        List<Shift> shifts;
+        if (warehouseId == null) {
+            // Admin: xem toàn bộ ca chờ duyệt trong hệ thống
+            shifts = shiftRepository.findAllByStatus(Shift.ShiftStatus.CLOSED);
+        } else {
+            // Manager: chỉ thấy ca của chi nhánh mình
+            shifts = shiftRepository.findByWarehouseIdAndStatus(
+                    warehouseId, Shift.ShiftStatus.CLOSED);
+        }
+        return shifts.stream().map(this::mapToResponse).toList();
     }
 
     // ─────────────────────────────────────────────────────────
@@ -113,10 +149,11 @@ public class ShiftService {
     public ShiftResponse mapToResponse(Shift shift) {
         BigDecimal revenue = BigDecimal.ZERO;
         if (shift.getId() != null) {
-            try { revenue = invoiceRepository.sumRevenueByShift(shift.getId()); }
-            catch (Exception ignored) {}
+            try {
+                BigDecimal r = invoiceRepository.sumRevenueByShift(shift.getId());
+                if (r != null) revenue = r;
+            } catch (Exception ignored) {}
         }
-        if (revenue == null) revenue = BigDecimal.ZERO;
         return ShiftResponse.builder()
                 .id(shift.getId())
                 .warehouseId(shift.getWarehouseId())

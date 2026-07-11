@@ -1,3 +1,4 @@
+
 package sme.backend.repository;
 
 import org.springframework.data.domain.Page;
@@ -18,17 +19,27 @@ public interface PurchaseOrderRepository extends JpaRepository<PurchaseOrder, UU
     Optional<PurchaseOrder> findByCode(String code);
     boolean existsByCode(String code);
 
-    // ĐÃ THÊM: Hỗ trợ Filter, Search theo Mã PO cho màn hình Quản lý
     @Query("""
         SELECT po FROM PurchaseOrder po
-        WHERE (:warehouseId IS NULL OR po.warehouseId = :warehouseId)
-        AND (:status IS NULL OR po.status = :status)
-        AND (:keyword IS NULL OR :keyword = '' OR LOWER(po.code) LIKE LOWER(CONCAT('%', :keyword, '%')))
+        WHERE po.status IN :statuses
+        AND (:keyword = '' OR LOWER(po.code) LIKE LOWER(CONCAT('%', :keyword, '%')))
         ORDER BY po.createdAt DESC
         """)
-    Page<PurchaseOrder> searchPurchaseOrders(
+    Page<PurchaseOrder> searchAllPurchaseOrders(
+            @Param("statuses") List<PurchaseOrder.PurchaseStatus> statuses,
+            @Param("keyword") String keyword,
+            Pageable pageable);
+
+    @Query("""
+        SELECT po FROM PurchaseOrder po
+        WHERE po.warehouseId = :warehouseId
+        AND po.status IN :statuses
+        AND (:keyword = '' OR LOWER(po.code) LIKE LOWER(CONCAT('%', :keyword, '%')))
+        ORDER BY po.createdAt DESC
+        """)
+    Page<PurchaseOrder> searchPurchaseOrdersByWarehouse(
             @Param("warehouseId") UUID warehouseId,
-            @Param("status") PurchaseOrder.PurchaseStatus status,
+            @Param("statuses") List<PurchaseOrder.PurchaseStatus> statuses,
             @Param("keyword") String keyword,
             Pageable pageable);
 

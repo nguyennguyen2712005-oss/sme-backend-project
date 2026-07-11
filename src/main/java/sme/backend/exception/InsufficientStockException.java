@@ -1,3 +1,4 @@
+
 package sme.backend.exception;
 
 import org.springframework.http.HttpStatus;

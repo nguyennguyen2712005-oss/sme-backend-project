@@ -1,3 +1,4 @@
+
 package sme.backend.ai;
 
 import jakarta.persistence.EntityManager;
@@ -29,7 +30,14 @@ import java.util.stream.Collectors;
  * 1. SYS-03: Upload file → Tika extract text → TokenTextSplitter chunking
  * → Gemini embedding → lưu vào pgvector
  * 2. Chat:   User message → pgvector similarity search → top-K chunks
- * → System prompt + context + message → Gemini → response
+ * → System prompt + context + message → Gemini → response (+ sources)
+ *
+ * LƯU Ý: lịch sử hội thoại (ai_chat_sessions/ai_chat_messages) chỉ tồn tại ở
+ * schema DB, KHÔNG được service này đọc/ghi - frontend hiện đang tự giữ toàn
+ * bộ lịch sử hội thoại trong React state và gửi lại nguyên văn ở mỗi lần gọi
+ * (param conversationHistory). Nghĩa là đóng tab/đóng panel chat là mất lịch
+ * sử - đây là một giới hạn có thật của bản hiện tại, không phải do ĐATN cần
+ * "session-based" mà do chưa nối dây tới 2 bảng đã có sẵn trong schema.
  */
 @Service
 @RequiredArgsConstructor
@@ -53,7 +61,6 @@ public class AiService {
         String fileName = fileResource.getFilename() != null ? fileResource.getFilename() : "unknown.txt";
         String fileExtension = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf(".") + 1) : "txt";
 
-        // 1. Lưu thông tin file vào DB trước để lấy ID
         KnowledgeDocument docRecord = KnowledgeDocument.builder()
                 .title(documentTitle)
                 .fileName(fileName)
@@ -64,11 +71,9 @@ public class AiService {
         docRecord = documentRepository.save(docRecord);
         final String docIdStr = docRecord.getId().toString();
 
-        // 2. Extract text với Apache Tika (hỗ trợ PDF, DOCX, PPTX...)
         TikaDocumentReader reader = new TikaDocumentReader(fileResource);
         List<Document> rawDocs = reader.get();
 
-        // 3. Thêm metadata để RAG có thể lọc (Gắn ID tài liệu vào Metadata)
         rawDocs.forEach(doc -> {
             doc.getMetadata().put("documentId", docIdStr);
             doc.getMetadata().put("source", documentTitle);
@@ -76,7 +81,6 @@ public class AiService {
             doc.getMetadata().put("indexedAt", Instant.now().toString());
         });
 
-        // 4. Chunking: chia nhỏ văn bản
         TokenTextSplitter splitter = TokenTextSplitter.builder()
                 .withChunkSize(appProperties.getAi().getChunkSize())
                 .withMinChunkSizeChars(100)
@@ -86,46 +90,37 @@ public class AiService {
                 .build();
         List<Document> chunks = splitter.apply(rawDocs);
 
-        // 5. Vector hóa + lưu vào pgvector
         vectorStore.add(chunks);
 
         log.info("Document indexed: {} chunks from '{}'", chunks.size(), documentTitle);
         return chunks.size();
     }
 
-    // ─────────────────────────────────────────────────────────
-    // GET ALL DOCUMENTS
-    // ─────────────────────────────────────────────────────────
     public List<KnowledgeDocument> getAllDocuments() {
         List<KnowledgeDocument> docs = documentRepository.findAllByOrderByCreatedAtDesc();
         docs.forEach(d -> d.setChunkCount(documentRepository.countChunksByDocumentId(d.getId())));
         return docs;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // DELETE DOCUMENT
-    // ─────────────────────────────────────────────────────────
     @Transactional
     public void deleteDocument(UUID documentId) {
-        // Xóa các vector nhúng trong pgvector (trực tiếp qua SQL Native)
         entityManager.createNativeQuery("DELETE FROM vector_store WHERE metadata->>'documentId' = :docId")
                 .setParameter("docId", documentId.toString())
                 .executeUpdate();
 
-        // Xóa bản ghi trong bảng quản lý
         documentRepository.deleteById(documentId);
         log.info("Deleted document and its vectors: {}", documentId);
     }
 
     // ─────────────────────────────────────────────────────────
     // AI CHAT — RAG Co-pilot (SYS-03 + MODULE AI)
+    // ĐÃ SỬA: trả về Map { reply, sources } thay vì String thuần, để FE hiển thị
+    // được "nguồn tài liệu AI đã dùng để trả lời" như đặc tả yêu cầu.
     // ─────────────────────────────────────────────────────────
-    public String chat(String userMessage, UUID userId, String conversationHistory) {
-        // Lấy thông tin user để personalise
+    public Map<String, Object> chat(String userMessage, UUID userId, String conversationHistory) {
         String userName = userRepository.findById(userId)
                 .map(User::getFullName).orElse("người dùng");
 
-        // 1. Tìm kiếm Vector thủ công (Manual RAG)
         List<Document> similarDocuments = vectorStore.similaritySearch(
                 SearchRequest.builder()
                         .query(userMessage)
@@ -134,29 +129,71 @@ public class AiService {
                         .build()
         );
 
-        // 2. Nối nội dung các chunk tìm được thành chuỗi Context
         String context = similarDocuments.stream()
-                .map(Document::getFormattedContent) 
+                .map(Document::getFormattedContent)
                 .collect(Collectors.joining("\n---\n"));
 
-        // 3. Đưa Context vào System Prompt
         String systemPrompt = buildSystemPrompt(userName, conversationHistory, context);
 
+        String reply;
         try {
-            return chatClient.prompt()
+            reply = chatClient.prompt()
                     .system(systemPrompt)
                     .user(userMessage)
                     .call()
                     .content();
         } catch (Exception e) {
             log.error("AI chat error: {}", e.getMessage(), e);
-            return "Xin lỗi, tôi gặp sự cố khi xử lý yêu cầu của bạn. Vui lòng thử lại.";
+            reply = "Xin lỗi, tôi gặp sự cố khi xử lý yêu cầu của bạn. Vui lòng thử lại.";
         }
+
+        // Mỗi tài liệu nguồn chỉ hiện 1 lần (nhiều chunk có thể cùng 1 tài liệu)
+        List<Map<String, String>> sources = similarDocuments.stream()
+                .map(doc -> {
+                    String title = String.valueOf(doc.getMetadata().getOrDefault("source", "Tài liệu nội bộ"));
+                    String content = doc.getFormattedContent();
+                    String excerpt = content.length() > 220 ? content.substring(0, 220) + "..." : content;
+                    Map<String, String> m = new LinkedHashMap<>();
+                    m.put("title", title);
+                    m.put("excerpt", excerpt);
+                    return m;
+                })
+                .collect(Collectors.toMap(m -> m.get("title"), m -> m, (a, b) -> a, LinkedHashMap::new))
+                .values().stream().toList();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("reply", reply);
+        result.put("sources", sources);
+        return result;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // VECTOR SEARCH (dùng cho sản phẩm tương tự)
-    // ─────────────────────────────────────────────────────────
+    /**
+     * ĐÃ THÊM: Câu hỏi gợi ý theo role, hardcode trong service vì với phạm vi
+     * ĐATN không cần thiết phải có bảng ai_suggested_questions riêng.
+     */
+    public List<String> getSuggestedQuestions(User.UserRole role) {
+        return switch (role) {
+            case ROLE_CASHIER -> List.of(
+                    "Quy trình mở ca làm việc như thế nào?",
+                    "Đóng ca bị lệch tiền thì xử lý ra sao?",
+                    "Cách xử lý khi khách muốn đổi trả sản phẩm?",
+                    "Đơn hàng online cần đóng gói xem ở đâu?"
+            );
+            case ROLE_MANAGER -> List.of(
+                    "Quy trình xác nhận đơn hàng online gồm các bước nào?",
+                    "Khi nào nên tạo phiếu chuyển kho giữa các chi nhánh?",
+                    "Làm sao để duyệt ca làm việc của nhân viên?",
+                    "Công nợ nhà cung cấp sắp đến hạn xem ở đâu?"
+            );
+            case ROLE_ADMIN -> List.of(
+                    "Cách thêm một chi nhánh mới vào hệ thống?",
+                    "Làm sao xem báo cáo doanh thu toàn chuỗi theo tháng?",
+                    "Khi nào nên dùng chức năng hủy khẩn cấp đơn hàng?",
+                    "Cách upload tài liệu để AI trả lời chính xác hơn?"
+            );
+        };
+    }
+
     public List<Document> searchSimilar(String query, int topK) {
         return vectorStore.similaritySearch(
                 SearchRequest.builder()
@@ -166,41 +203,36 @@ public class AiService {
                         .build()
         );
     }
-// ─────────────────────────────────────────────────────────
-    // LẤY CHI TIẾT CÁC CHUNKS CỦA TÀI LIỆU
-    // ─────────────────────────────────────────────────────────
+
     public List<String> getDocumentChunks(UUID documentId) {
-        // Dùng Native Query truy vấn trực tiếp vào bảng vector_store
         @SuppressWarnings("unchecked")
         List<String> chunks = entityManager.createNativeQuery(
                 "SELECT content FROM vector_store WHERE metadata->>'documentId' = :docId"
         )
         .setParameter("docId", documentId.toString())
         .getResultList();
-        
+
         return chunks;
     }
-    // ─────────────────────────────────────────────────────────
-    // PRIVATE HELPERS
-    // ─────────────────────────────────────────────────────────
+
     private String buildSystemPrompt(String userName, String conversationHistory, String context) {
         return """
-                Bạn là AI Co-pilot của hệ thống SME ERP & POS, trợ lý thông minh cho doanh nghiệp vừa và nhỏ.
-                
+                Bạn là AI Co-pilot của hệ thống quản lý nhà sách đa chi nhánh Bookly, trợ lý thông minh cho nhân viên.
+
                 Vai trò của bạn:
                 - Trả lời câu hỏi về nghiệp vụ: bán hàng, kho, tài chính, đơn hàng
                 - Phân tích dữ liệu và đưa ra gợi ý kinh doanh
                 - Hỗ trợ tra cứu chính sách, quy trình nội bộ từ tài liệu đã upload
                 - Giao tiếp bằng tiếng Việt, thân thiện và chuyên nghiệp
-                
+
                 Tên người dùng: %s
-                
+
                 THÔNG TIN NGỮ CẢNH TỪ TÀI LIỆU (RAG):
                 %s
-                
+
                 LỊCH SỬ HỘI THOẠI:
                 %s
-                
+
                 Lưu ý quan trọng:
                 - Ưu tiên sử dụng "THÔNG TIN NGỮ CẢNH" để trả lời nếu câu hỏi liên quan đến tài liệu.
                 - Nếu không tìm thấy thông tin trong ngữ cảnh, hãy nói rõ và tuyệt đối không bịa đặt (hallucinate).

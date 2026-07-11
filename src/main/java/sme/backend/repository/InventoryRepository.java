@@ -32,10 +32,11 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
     List<Inventory> findByProductId(UUID productId);
     List<Inventory> findByProductIdIn(List<UUID> productIds);
 
-    // ĐÃ SỬA: Thêm i.quantity > 0
+    // ─── TÌM TỒN KHO THẤP (TÁCH 2 HÀM ĐỂ TRÁNH LỖI BYTEA POSTGRESQL) ───
+    
     @Query("""
         SELECT i FROM Inventory i
-        WHERE (CAST(:wid AS uuid) IS NULL OR i.warehouseId = CAST(:wid AS uuid))
+        WHERE i.warehouseId = :wid
         AND i.minQuantity > 0
         AND i.quantity > 0
         AND i.quantity <= i.minQuantity
@@ -43,7 +44,6 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
         """)
     List<Inventory> findLowStockByWarehouse(@Param("wid") UUID warehouseId);
 
-    // ĐÃ SỬA: Thêm i.quantity > 0
     @Query("""
         SELECT new sme.backend.dto.response.LowStockItem(
             i.id, i.productId, p.name, p.sku, i.warehouseId, w.name,
@@ -52,7 +52,7 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
         FROM Inventory i
         JOIN sme.backend.entity.Product p ON p.id = i.productId
         JOIN sme.backend.entity.Warehouse w ON w.id = i.warehouseId
-        WHERE (CAST(:wid AS uuid) IS NULL OR i.warehouseId = CAST(:wid AS uuid))
+        WHERE i.warehouseId = :wid
         AND i.minQuantity > 0
         AND i.quantity > 0
         AND i.quantity <= i.minQuantity
@@ -60,20 +60,51 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
         """)
     List<LowStockItem> findLowStockWithNameByWarehouse(@Param("wid") UUID warehouseId);
 
+    @Query("""
+        SELECT new sme.backend.dto.response.LowStockItem(
+            i.id, i.productId, p.name, p.sku, i.warehouseId, w.name,
+            i.quantity, i.minQuantity, i.reservedQuantity
+        )
+        FROM Inventory i
+        JOIN sme.backend.entity.Product p ON p.id = i.productId
+        JOIN sme.backend.entity.Warehouse w ON w.id = i.warehouseId
+        WHERE i.minQuantity > 0
+        AND i.quantity > 0
+        AND i.quantity <= i.minQuantity
+        ORDER BY i.quantity ASC
+        """)
+    List<LowStockItem> findAllLowStockWithName();
+
+    // ─── CÁC HÀM KHÁC ───
+
     @Query("SELECT COALESCE(SUM(i.quantity - i.reservedQuantity), 0) FROM Inventory i WHERE i.productId = :pid")
     Integer getTotalAvailableQuantity(@Param("pid") UUID productId);
+
+    @Query("SELECT i.productId, COALESCE(SUM(i.quantity - i.reservedQuantity), 0) FROM Inventory i WHERE i.productId IN :productIds GROUP BY i.productId")
+    List<Object[]> getBulkTotalAvailableQuantity(@Param("productIds") List<UUID> productIds);
+
+    // ─── BÁO CÁO GIÁ TRỊ TỒN KHO ───
+    
+    @Query(value = """
+        SELECT w.name AS warehouse_name, COUNT(i.id) AS sku_count, SUM(i.quantity) AS total_qty, SUM(i.quantity * p.mac_price) AS total_value
+        FROM inventories i JOIN warehouses w ON w.id = i.warehouse_id JOIN products p ON p.id = i.product_id
+        WHERE i.warehouse_id = :wid GROUP BY w.id, w.name
+        """, nativeQuery = true)
+    List<Map<String, Object>> getInventoryValueReportByWarehouse(@Param("wid") UUID warehouseId);
 
     @Query(value = """
         SELECT w.name AS warehouse_name, COUNT(i.id) AS sku_count, SUM(i.quantity) AS total_qty, SUM(i.quantity * p.mac_price) AS total_value
         FROM inventories i JOIN warehouses w ON w.id = i.warehouse_id JOIN products p ON p.id = i.product_id
-        WHERE (CAST(:wid AS uuid) IS NULL OR i.warehouse_id = CAST(:wid AS uuid)) GROUP BY w.id, w.name
+        GROUP BY w.id, w.name
         """, nativeQuery = true)
-    List<Map<String, Object>> getInventoryValueReport(@Param("wid") UUID warehouseId);
+    List<Map<String, Object>> getInventoryValueReportAll();
 
+    // ─── BÁO CÁO HÀNG TỒN ĐỌNG ───
+    
     @Query(value = """
         SELECT i.id, i.quantity, p.name AS product_name, p.isbn_barcode
         FROM inventories i JOIN products p ON p.id = i.product_id
-        WHERE (CAST(:wid AS uuid) IS NULL OR i.warehouse_id = CAST(:wid AS uuid)) AND i.quantity > 0
+        WHERE i.warehouse_id = :wid AND i.quantity > 0
         AND NOT EXISTS (
             SELECT 1 FROM inventory_transactions t WHERE t.inventory_id = i.id
             AND t.transaction_type IN ('SALE_POS','SALE_ONLINE') AND t.created_at > NOW() - INTERVAL '1 day' * :days
@@ -81,11 +112,20 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
         """, nativeQuery = true)
     List<Map<String, Object>> findDeadStockByWarehouse(@Param("wid") UUID warehouseId, @Param("days") int days);
 
-    @Query("SELECT i.productId, COALESCE(SUM(i.quantity - i.reservedQuantity), 0) FROM Inventory i WHERE i.productId IN :productIds GROUP BY i.productId")
-    List<Object[]> getBulkTotalAvailableQuantity(@Param("productIds") List<UUID> productIds);
+    @Query(value = """
+        SELECT i.id, i.quantity, p.name AS product_name, p.isbn_barcode
+        FROM inventories i JOIN products p ON p.id = i.product_id
+        WHERE i.quantity > 0
+        AND NOT EXISTS (
+            SELECT 1 FROM inventory_transactions t WHERE t.inventory_id = i.id
+            AND t.transaction_type IN ('SALE_POS','SALE_ONLINE') AND t.created_at > NOW() - INTERVAL '1 day' * :days
+        ) ORDER BY i.quantity DESC
+        """, nativeQuery = true)
+    List<Map<String, Object>> findDeadStockAll(@Param("days") int days);
 
-    // ĐÃ SỬA: Thêm i.quantity > 0 vào CASE WHEN và điều kiện LOW_STOCK
-    @Query("""
+    // ─── TÌM KIẾM TỒN KHO (Đã an toàn vì warehouseId luôn bắt buộc) ───
+    
+     @Query("""
         SELECT new sme.backend.dto.response.InventoryResponse(
             i.id, p.id, p.name, p.sku, p.isbnBarcode, p.imageUrl, c.name, 
             i.quantity, 
@@ -103,7 +143,7 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
              OR LOWER(p.name) LIKE LOWER(CONCAT('%', :keyword, '%')) 
              OR LOWER(p.sku) LIKE LOWER(CONCAT('%', :keyword, '%')) 
              OR p.isbnBarcode LIKE CONCAT('%', :keyword, '%'))
-        AND (:categoryId IS NULL OR p.categoryId = :categoryId)
+        AND (:categoryId IS NULL OR CAST(p.categoryId AS string) = :categoryId)
         AND (:status IS NULL OR :status = '' OR :status = 'ALL'
             OR (:status = 'IN_STOCK' AND i.quantity > 0 AND (i.minQuantity = 0 OR i.quantity > i.minQuantity))
             OR (:status = 'LOW_STOCK' AND i.minQuantity > 0 AND i.quantity > 0 AND i.quantity <= i.minQuantity)
@@ -113,7 +153,7 @@ public interface InventoryRepository extends JpaRepository<Inventory, UUID> {
     Page<InventoryResponse> searchInventoryWithProductDetails(
             @Param("warehouseId") UUID warehouseId,
             @Param("keyword") String keyword,
-            @Param("categoryId") UUID categoryId,
+            @Param("categoryId") String categoryId,
             @Param("status") String status,
             Pageable pageable
     );

@@ -19,7 +19,7 @@ import sme.backend.exception.ResourceNotFoundException;
 import sme.backend.repository.CustomerRepository;
 import sme.backend.repository.InvoiceRepository;
 import sme.backend.repository.OrderRepository;
-import sme.backend.service.CustomerService; // <-- THÊM IMPORT NÀY
+import sme.backend.service.CustomerService;
 
 import java.util.List;
 import java.util.Map;
@@ -33,9 +33,8 @@ public class CustomerController {
     private final CustomerRepository customerRepository;
     private final InvoiceRepository invoiceRepository; 
     private final OrderRepository orderRepository;
-    private final CustomerService customerService; // <-- THÊM DÒNG NÀY
+    private final CustomerService customerService;
 
-    /** GET /customers/lookup?phone=... — POS-03: Định danh khách (F3) */
     @GetMapping("/lookup")
     @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<Customer>> lookupByPhone(@RequestParam String phone) {
@@ -45,7 +44,6 @@ public class CustomerController {
         return ResponseEntity.ok(ApiResponse.ok(customer));
     }
 
-    /** GET /customers — Tìm kiếm CRM (ĐÃ NÂNG CẤP THÊM LỌC THEO TIER) */
     @GetMapping
     @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')") 
     public ResponseEntity<ApiResponse<PageResponse<Customer>>> search(
@@ -63,12 +61,13 @@ public class CustomerController {
                 customerTier = Customer.CustomerTier.valueOf(tier.toUpperCase());
             } catch (IllegalArgumentException ignored) {}
         }
+        
+        String tierStr = customerTier != null ? customerTier.name() : null;
 
         return ResponseEntity.ok(ApiResponse.ok(
-                PageResponse.of(customerRepository.searchWithFilters(kw, customerTier, pageable))));
+                PageResponse.of(customerRepository.searchWithFilters(kw, tierStr, pageable))));
     }
 
-    /** GET /customers/top — Lấy top khách hàng chi tiêu cao */
     @GetMapping("/top")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<PageResponse<Customer>>> getTopSpenders(
@@ -79,7 +78,6 @@ public class CustomerController {
                 PageResponse.of(customerRepository.findTopCustomers(pageable))));
     }
 
-    /** GET /customers/{id}/history — Lấy lịch sử mua hàng (POS & Online) */
     @GetMapping("/{id}/history")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN','CASHIER')")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getCustomerHistory(
@@ -111,13 +109,17 @@ public class CustomerController {
                 "createdAt", ord.getCreatedAt()
         )).toList();
 
+        // ĐÃ SỬA: Trả về thêm thông tin phân trang
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
             "invoices", invoiceSummary,
-            "orders", orderSummary
+            "invoicesTotalPages", invoices.getTotalPages(),
+            "invoicesTotalElements", invoices.getTotalElements(),
+            "orders", orderSummary,
+            "ordersTotalPages", orders.getTotalPages(),
+            "ordersTotalElements", orders.getTotalElements()
         )));
     }
 
-    /** POST /customers — Tạo khách hàng mới */
     @PostMapping
     @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<Customer>> create(
@@ -148,7 +150,6 @@ public class CustomerController {
                 .body(ApiResponse.created(customerRepository.save(customer)));
     }
 
-    // === THÊM ENDPOINT MỚI: POST /customers/bulk ===
     @PostMapping("/bulk")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<Integer>> importBulk(@RequestBody List<Customer> requests) {
@@ -156,7 +157,6 @@ public class CustomerController {
         return ResponseEntity.ok(ApiResponse.ok("Import thành công " + importedCount + " khách hàng", importedCount));
     }
 
-    /** PUT /customers/{id} — Cập nhật thông tin / Khóa tài khoản */
     @PutMapping("/{id}")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<Customer>> update(
@@ -194,7 +194,6 @@ public class CustomerController {
         return ResponseEntity.ok(ApiResponse.ok("Cập nhật thành công", customerRepository.save(customer)));
     }
 
-    /** GET /customers/{id} */
     @GetMapping("/{id}")
     @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<Customer>> getById(@PathVariable UUID id) {

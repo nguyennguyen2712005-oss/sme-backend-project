@@ -1,3 +1,4 @@
+
 package sme.backend.entity;
 
 import jakarta.persistence.*;
@@ -15,7 +16,7 @@ import java.util.UUID;
 @Entity
 @Table(name = "orders")
 @Audited
-@AuditTable("orders_audit") // <-- ĐÃ THÊM DÒNG NÀY ĐỂ ÉP HIBERNATE TÌM ĐÚNG BẢNG
+@AuditTable("orders_audit")
 @Getter @Setter
 @NoArgsConstructor @AllArgsConstructor
 @Builder
@@ -101,18 +102,36 @@ public class Order extends BaseEntity {
     @Column(name = "cancelled_reason", columnDefinition = "TEXT")
     private String cancelledReason;
 
-    @NotAudited // Không track lịch sử của list items con
+    @NotAudited
     @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
     private List<OrderItem> items = new ArrayList<>();
 
-    @NotAudited // Không track lịch sử của list status con
+    @NotAudited
     @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
     private List<OrderStatusHistory> statusHistory = new ArrayList<>();
 
+    /**
+     * LƯU Ý KHI ĐỌC ENUM NÀY:
+     * - status là cột VARCHAR(50) trong DB (KHÔNG phải Postgres ENUM thật), nên việc
+     *   thêm/sửa giá trị enum dưới đây KHÔNG cần ALTER TABLE / migration gì cả.
+     * - Pipeline cũ (PENDING -> PACKING -> SHIPPING -> DELIVERED) bị xoá khái niệm
+     *   "đã xác nhận" và "đã đóng gói xong" làm một (PACKING vừa là "đang xử lý"
+     *   vừa là cổng để Cashier có thể tự ý chuyển thẳng sang SHIPPING/DELIVERED/CANCELLED
+     *   vì validateTransition cũ không quan tâm role). Enum mới tách rõ 2 bước này
+     *   để mỗi bước có thể gắn một @PreAuthorize / business rule riêng ở Service.
+     */
     public enum OrderStatus {
-        PENDING, PACKING, WAITING_FOR_CONSOLIDATION, SHIPPING, DELIVERED, CANCELLED, RETURNED
+        WAITING_FOR_CONSOLIDATION, // Hệ thống đang gom hàng từ nhiều kho (giữ nguyên, đang hoạt động tốt)
+        PENDING,                   // Khách vừa đặt / Telesale vừa tạo - chờ Manager xác nhận
+        CONFIRMED,                 // Manager đã xác nhận còn hàng - sẵn sàng để đóng gói
+        PACKED,                    // Cashier/Manager đã đóng gói xong
+        SHIPPING,                  // Đang giao (chỉ áp dụng cho type = DELIVERY)
+        READY_FOR_PICKUP,          // Sẵn sàng cho khách lấy tại quầy (chỉ áp dụng cho type = BOPIS)
+        DELIVERED,                 // Hoàn tất - đã giao hoặc khách đã lấy tại quầy
+        CANCELLED,                 // Đã hủy
+        RETURNED                   // Đã hoàn trả sau khi DELIVERED
     }
 
     public enum OrderType {
@@ -134,33 +153,46 @@ public class Order extends BaseEntity {
     }
 
     public void transitionTo(OrderStatus newStatus, String note, String changedBy) {
-        validateTransition(this.status, newStatus);
-        
+        validateTransition(this.status, newStatus, this.type);
+
         OrderStatusHistory history = OrderStatusHistory.builder()
                 .oldStatus(this.status.name())
                 .newStatus(newStatus.name())
                 .note(note)
                 .changedBy(changedBy)
                 .build();
-                
+
         this.status = newStatus;
         this.addStatusHistory(history);
     }
 
-    private void validateTransition(OrderStatus from, OrderStatus to) {
+    /**
+     * State machine có phân biệt theo OrderType:
+     * - DELIVERY: PACKED -> SHIPPING -> DELIVERED
+     * - BOPIS:    PACKED -> READY_FOR_PICKUP -> DELIVERED (đơn cũ trước đây dùng
+     *   chung pipeline với DELIVERY dù nghiệp vụ BOPIS không hề "giao đi" - đây là
+     *   một lỗ hổng thực tế của code cũ, không phải giả định).
+     *
+     * Việc AI role nào được PHÉP gọi transition này không được check ở đây - tầng
+     * này chỉ đảm bảo tính hợp lệ của state machine. Quyền theo role được chốt ở
+     * OrderService (mỗi action có method + @PreAuthorize riêng ở Controller).
+     */
+    private void validateTransition(OrderStatus from, OrderStatus to, OrderType type) {
         boolean valid = switch (from) {
-            // ĐÃ THÊM: Cho phép chuyển từ Chờ gom hàng sang PENDING hoặc Hủy
             case WAITING_FOR_CONSOLIDATION -> to == OrderStatus.PENDING || to == OrderStatus.CANCELLED;
-            
-            case PENDING -> to == OrderStatus.PACKING || to == OrderStatus.CANCELLED;
-            case PACKING -> to == OrderStatus.SHIPPING || to == OrderStatus.CANCELLED;
-            case SHIPPING -> to == OrderStatus.DELIVERED || to == OrderStatus.RETURNED;
-            case DELIVERED -> to == OrderStatus.RETURNED;
-            default -> false;
+            case PENDING    -> to == OrderStatus.CONFIRMED || to == OrderStatus.CANCELLED;
+            case CONFIRMED  -> to == OrderStatus.PACKED || to == OrderStatus.CANCELLED;
+            case PACKED     -> (type == OrderType.DELIVERY && to == OrderStatus.SHIPPING)
+                             || (type == OrderType.BOPIS && to == OrderStatus.READY_FOR_PICKUP)
+                             || to == OrderStatus.CANCELLED;
+            case SHIPPING         -> to == OrderStatus.DELIVERED || to == OrderStatus.RETURNED;
+            case READY_FOR_PICKUP -> to == OrderStatus.DELIVERED || to == OrderStatus.CANCELLED;
+            case DELIVERED  -> to == OrderStatus.RETURNED;
+            default -> false; // CANCELLED, RETURNED là trạng thái cuối (terminal)
         };
         if (!valid) {
             throw new IllegalStateException(
-                    String.format("Không thể chuyển trạng thái từ %s sang %s", from, to)
+                    String.format("Không thể chuyển trạng thái từ %s sang %s (loại đơn: %s)", from, to, type)
             );
         }
     }

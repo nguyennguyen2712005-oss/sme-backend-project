@@ -1,3 +1,4 @@
+
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -244,7 +245,8 @@ public class InventoryService {
 
     @Transactional(readOnly = true)
     public Page<InventoryResponse> searchInventory(UUID warehouseId, String keyword, UUID categoryId, String status, Pageable pageable) {
-        return inventoryRepository.searchInventoryWithProductDetails(warehouseId, keyword, categoryId, status, pageable);
+        String catIdStr = categoryId != null ? categoryId.toString() : null;
+        return inventoryRepository.searchInventoryWithProductDetails(warehouseId, keyword, catIdStr, status, pageable);
     }
 
     @Transactional(readOnly = true)

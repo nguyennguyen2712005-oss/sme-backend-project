@@ -1,3 +1,4 @@
+
 package sme.backend.controller;
 
 import jakarta.validation.Valid;
@@ -78,8 +79,15 @@ public class InventoryController {
     public ResponseEntity<ApiResponse<List<LowStockItem>>> getLowStock(
             @AuthenticationPrincipal UserPrincipal principal,
             @RequestParam(required = false) UUID warehouseId) {
+        
         UUID wid = (principal.getRole() == User.UserRole.ROLE_ADMIN) && warehouseId != null ? warehouseId : principal.getWarehouseId();
-        return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.findLowStockWithNameByWarehouse(wid)));
+        
+        // ĐÃ SỬA: Gọi hàm riêng biệt để tránh lỗi ép kiểu null của PostgreSQL
+        if (wid == null) {
+            return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.findAllLowStockWithName()));
+        } else {
+            return ResponseEntity.ok(ApiResponse.ok(inventoryRepository.findLowStockWithNameByWarehouse(wid)));
+        }
     }
 
     @PostMapping("/adjust")

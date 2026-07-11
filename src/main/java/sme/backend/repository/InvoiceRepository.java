@@ -24,6 +24,8 @@ public interface InvoiceRepository extends JpaRepository<Invoice, UUID> {
 
     Page<Invoice> findByShiftIdOrderByCreatedAtDesc(UUID shiftId, Pageable pageable);
 
+    long countByShiftId(UUID shiftId);
+
     Page<Invoice> findByCustomerIdOrderByCreatedAtDesc(UUID customerId, Pageable pageable);
 
     @Query("""
@@ -33,13 +35,45 @@ public interface InvoiceRepository extends JpaRepository<Invoice, UUID> {
         """)
     Optional<Invoice> findByIdWithDetails(@Param("id") UUID id);
 
+    // [FIX-1] Lấy toàn bộ hóa đơn trả hàng đã được tạo từ một hóa đơn gốc
+    // Dùng để kiểm tra double refund: tổng số lượng đã trả của từng sản phẩm
+    // không được vượt quá số lượng trong hóa đơn gốc.
+    List<Invoice> findByReturnOfId(UUID returnOfId);
+
+    // [FIX-1] Lấy kèm items để tính tổng quantity đã hoàn trả — tránh N+1
+    @Query("""
+        SELECT DISTINCT i FROM Invoice i
+        JOIN FETCH i.items
+        WHERE i.returnOfId = :returnOfId
+        AND i.type = 'RETURN'
+        """)
+    List<Invoice> findReturnInvoicesWithItemsByReturnOfId(@Param("returnOfId") UUID returnOfId);
+
+    // Kiểm tra hóa đơn có thuộc đúng chi nhánh (via shift -> warehouse) không
+    @Query("""
+        SELECT COUNT(i) > 0 FROM Invoice i
+        JOIN Shift s ON s.id = i.shiftId
+        WHERE i.id = :invoiceId
+        AND s.warehouseId = :warehouseId
+        """)
+    boolean existsByIdAndWarehouseId(
+            @Param("invoiceId") UUID invoiceId,
+            @Param("warehouseId") UUID warehouseId);
+
     @Query("""
         SELECT COALESCE(SUM(i.finalAmount), 0) FROM Invoice i
         WHERE i.shiftId = :shiftId AND i.type = 'SALE'
         """)
     BigDecimal sumRevenueByShift(@Param("shiftId") UUID shiftId);
 
-    // ĐÃ SỬA: GỘP DOANH THU POS VÀ DOANH THU ĐƠN HÀNG ONLINE
+    @Query("""
+        SELECT COUNT(i) FROM Invoice i
+        WHERE i.shiftId IN (SELECT s.id FROM Shift s WHERE (:wid IS NULL OR s.warehouseId = :wid))
+        AND i.type = 'SALE'
+        AND i.createdAt BETWEEN :from AND :to
+        """)
+    long countPOSInvoices(@Param("wid") UUID warehouseId, @Param("from") Instant from, @Param("to") Instant to);
+
     @Query(value = """
         SELECT
             period,

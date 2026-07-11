@@ -1,3 +1,4 @@
+
 package sme.backend.repository;
 
 import org.springframework.data.domain.Page;
@@ -80,11 +81,11 @@ public interface ProductRepository extends JpaRepository<Product, UUID> {
             @Param("toDate") Instant toDate,
             @Param("limit") int limit);
             
-    @Query("""
+   @Query("""
             SELECT p FROM Product p
-            WHERE (:categoryId IS NULL OR p.categoryId = :categoryId)
-            AND (:supplierId IS NULL OR p.supplierId = :supplierId)
-            AND (:isActive IS NULL OR p.isActive = :isActive)
+            WHERE (:categoryId IS NULL OR CAST(p.categoryId AS string) = :categoryId)
+            AND (:supplierId IS NULL OR CAST(p.supplierId AS string) = :supplierId)
+            AND (:isActive IS NULL OR CAST(p.isActive AS string) = :isActive)
             AND (:keyword IS NULL OR :keyword = ''
             OR LOWER(p.name) LIKE LOWER(CONCAT('%', :keyword, '%'))
             OR p.isbnBarcode LIKE CONCAT('%', :keyword, '%')
@@ -92,8 +93,8 @@ public interface ProductRepository extends JpaRepository<Product, UUID> {
             ORDER BY p.name
             """)
     Page<Product> searchProducts(@Param("keyword") String keyword, 
-                                 @Param("categoryId") UUID categoryId, 
-                                 @Param("supplierId") UUID supplierId, 
-                                 @Param("isActive") Boolean isActive,
+                                 @Param("categoryId") String categoryId, 
+                                 @Param("supplierId") String supplierId, 
+                                 @Param("isActive") String isActive,
                                  Pageable pageable);
 }

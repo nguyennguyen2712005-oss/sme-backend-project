@@ -1,3 +1,4 @@
+
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -93,12 +94,20 @@ public class ProductService {
 
     @Transactional(readOnly = true)
     public Page<ProductResponse> search(String keyword, UUID categoryId, UUID supplierId, Boolean isActive, Pageable pageable) {
-        Page<Product> productPage = productRepository.searchProducts(keyword, categoryId, supplierId, isActive, pageable);
+        
+        // Ép sang String để tránh lỗi bytea của PostgreSQL
+        String catIdStr = categoryId != null ? categoryId.toString() : null;
+        String supIdStr = supplierId != null ? supplierId.toString() : null;
+        String isActiveStr = isActive != null ? isActive.toString() : null;
+        String kw = keyword == null ? "" : keyword.trim();
+
+        Page<Product> productPage = productRepository.searchProducts(kw, catIdStr, supIdStr, isActiveStr, pageable);
 
         if (productPage.isEmpty()) {
             return productPage.map(p -> mapToResponse(p, 0));
         }
 
+        // ... phần còn lại của hàm giữ nguyên
         List<UUID> categoryIds = productPage.getContent().stream()
                 .map(Product::getCategoryId).filter(Objects::nonNull).distinct().toList();
                 

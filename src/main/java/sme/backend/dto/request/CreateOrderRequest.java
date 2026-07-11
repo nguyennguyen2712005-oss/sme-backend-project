@@ -3,6 +3,7 @@ package sme.backend.dto.request;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.*;
 import lombok.Data;
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
@@ -22,6 +23,12 @@ public class CreateOrderRequest {
     private String type;     // DELIVERY (default) | BOPIS
     private String note;
     private UUID assignedWarehouseId;
+    
+    // ĐÃ THÊM: 3 trường mới
+    @Min(0) private BigDecimal shippingFee;
+    private String promotionCode;
+    private Integer pointsToUse;
+
     @Data
     public static class OrderItemRequest {
         @NotNull private UUID productId;

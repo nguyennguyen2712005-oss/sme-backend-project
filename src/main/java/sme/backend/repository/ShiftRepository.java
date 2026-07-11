@@ -15,19 +15,25 @@ import java.util.UUID;
 @Repository
 public interface ShiftRepository extends JpaRepository<Shift, UUID> {
 
-    // Tìm ca đang OPEN của thu ngân → dùng khi tạo Invoice
     Optional<Shift> findByCashierIdAndStatus(UUID cashierId, Shift.ShiftStatus status);
 
-    // Kiểm tra xem cashier có đang có ca mở không
     boolean existsByCashierIdAndStatus(UUID cashierId, Shift.ShiftStatus status);
 
-    // Danh sách ca theo kho, sắp xếp mới nhất
     Page<Shift> findByWarehouseIdOrderByOpenedAtDesc(UUID warehouseId, Pageable pageable);
 
-    // Ca chờ Manager duyệt
+    // Danh sách ca theo kho — dùng cho MANAGER
     List<Shift> findByWarehouseIdAndStatus(UUID warehouseId, Shift.ShiftStatus status);
 
-    // Lấy ca gần nhất đã approved của cashier để tính theoretical cash tiếp theo
+    // [FIX-6] Admin: xem toàn bộ ca chờ duyệt (tất cả chi nhánh).
+    // ShiftRepository trước đây chỉ có findByWarehouseIdAndStatus(),
+    // query WHERE warehouse_id = NULL luôn trả 0 rows → Admin thấy list rỗng.
+    @Query("""
+        SELECT s FROM Shift s
+        WHERE s.status = :status
+        ORDER BY s.closedAt DESC
+        """)
+    List<Shift> findAllByStatus(@Param("status") Shift.ShiftStatus status);
+
     @Query("""
         SELECT s FROM Shift s
         WHERE s.cashierId = :cashierId
@@ -36,7 +42,6 @@ public interface ShiftRepository extends JpaRepository<Shift, UUID> {
         """)
     List<Shift> findLatestApprovedByCashier(@Param("cashierId") UUID cashierId, Pageable pageable);
 
-    // Tính tổng thu tiền mặt trong ca (dùng cho theoretical cash)
     @Query("""
         SELECT COALESCE(SUM(ct.amount), 0)
         FROM CashbookTransaction ct

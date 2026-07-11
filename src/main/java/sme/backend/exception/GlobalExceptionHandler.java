@@ -1,3 +1,4 @@
+
 package sme.backend.exception;
 
 import jakarta.servlet.http.HttpServletRequest;

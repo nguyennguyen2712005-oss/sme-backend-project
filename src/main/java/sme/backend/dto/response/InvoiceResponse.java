@@ -14,6 +14,9 @@ public class InvoiceResponse {
     private String code;
     private UUID shiftId;
     private UUID customerId;
+    
+    private UUID returnOfId; // <--- THÊM DÒNG NÀY VÀO ĐÂY
+    
     private String customerName;
     private String customerPhone;
     private String type;

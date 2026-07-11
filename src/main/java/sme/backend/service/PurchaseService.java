@@ -1,3 +1,4 @@
+
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -15,6 +16,7 @@ import sme.backend.repository.*;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -27,6 +29,7 @@ public class PurchaseService {
     private final SupplierDebtRepository supplierDebtRepository;
     private final ProductRepository productRepository;
     private final InventoryService inventoryService;
+    private final CodeGeneratorService codeGenerator; // [FIX-7] PostgreSQL sequence, tránh trùng mã khi concurrent
 
     @Transactional
     public PurchaseOrder createPurchaseOrder(CreatePurchaseOrderRequest req, UUID createdBy) {
@@ -34,7 +37,7 @@ public class PurchaseService {
                 .orElseThrow(() -> new ResourceNotFoundException("Supplier", req.getSupplierId()));
 
         PurchaseOrder po = PurchaseOrder.builder()
-                .code(generatePOCode()).supplierId(req.getSupplierId()).warehouseId(req.getWarehouseId())
+                .code(codeGenerator.nextPurchaseOrderCode()).supplierId(req.getSupplierId()).warehouseId(req.getWarehouseId()) // [FIX-7]
                 .createdByUserId(createdBy).note(req.getNote()).status(PurchaseOrder.PurchaseStatus.PENDING)
                 .build();
 
@@ -97,10 +100,18 @@ public class PurchaseService {
         return purchaseOrderRepository.save(po);
     }
 
-    // ĐÃ SỬA: Cập nhật hàm để Search & Filter
     @Transactional(readOnly = true)
     public Page<PurchaseOrder> searchOrders(UUID warehouseId, String keyword, PurchaseOrder.PurchaseStatus status, Pageable pageable) {
-        return purchaseOrderRepository.searchPurchaseOrders(warehouseId, status, keyword, pageable);
+        List<PurchaseOrder.PurchaseStatus> statuses = (status == null) 
+                ? List.of(PurchaseOrder.PurchaseStatus.values()) 
+                : List.of(status);
+        String kw = (keyword == null) ? "" : keyword.trim();
+        
+        if (warehouseId == null) {
+            return purchaseOrderRepository.searchAllPurchaseOrders(statuses, kw, pageable);
+        } else {
+            return purchaseOrderRepository.searchPurchaseOrdersByWarehouse(warehouseId, statuses, kw, pageable);
+        }
     }
 
     @Transactional(readOnly = true)
@@ -113,5 +124,5 @@ public class PurchaseService {
         return purchaseOrderRepository.findByIdWithItems(id).orElseThrow(() -> new ResourceNotFoundException("PurchaseOrder", id));
     }
 
-    private String generatePOCode() { return "PO-" + System.currentTimeMillis(); }
+
 }

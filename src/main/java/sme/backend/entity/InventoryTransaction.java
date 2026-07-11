@@ -1,3 +1,4 @@
+
 package sme.backend.entity;
 
 import jakarta.persistence.*;
