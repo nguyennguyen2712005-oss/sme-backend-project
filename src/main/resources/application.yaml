@@ -28,7 +28,7 @@ spring:
   # ========================
   jpa:
     hibernate:
-      ddl-auto: validate         # Flyway quản lý schema, Hibernate chỉ validate
+      ddl-auto: validate
     show-sql: false
     properties:
       hibernate:
@@ -74,27 +74,9 @@ spring:
   # ========================
   batch:
     job:
-      enabled: false             # Tắt auto-run khi khởi động
+      enabled: false
     jdbc:
-      initialize-schema: always  # Tạo schema batch tự động
-
-  # ========================
-  # EMAIL (MỚI THÊM)
-  # ========================
-  mail:
-    host: ${MAIL_HOST:smtp.gmail.com}
-    port: ${MAIL_PORT:587}
-    username: ${MAIL_USERNAME:}
-    password: ${MAIL_PASSWORD:}
-    properties:
-      mail:
-        smtp:
-          auth: true
-          starttls:
-            enable: true
-          connectiontimeout: 5000
-          timeout: 5000
-          writetimeout: 5000
+      initialize-schema: always
 
   # ========================
   # SPRING AI - Dùng Gemini qua chuẩn OpenAI
@@ -117,8 +99,8 @@ spring:
       pgvector:
         index-type: HNSW
         distance-type: COSINE_DISTANCE
-        dimensions: 768           # Gemini embedding dimensions
-        initialize-schema: false  # Flyway quản lý
+        dimensions: 768
+        initialize-schema: false
 
 cloudinary:
   cloud-name: ${CLOUDINARY_CLOUD_NAME:}
@@ -146,20 +128,17 @@ spring.servlet:
 # APPLICATION CUSTOM CONFIG
 # ========================
 app:
-  # JWT Settings
   jwt:
     secret: ${JWT_SECRET:local_secret_key_change_in_production_environment}
-    expiration-ms: 86400000      # 24 giờ
-    refresh-expiration-ms: 604800000  # 7 ngày
+    expiration-ms: 86400000
+    refresh-expiration-ms: 604800000
 
-  # CORS
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
     allowed-methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     allowed-headers: "*"
     allow-credentials: true
 
-  # Business Logic
   business:
     low-stock-threshold: 10       
     dead-stock-days: 90           
@@ -168,22 +147,25 @@ app:
     silver-threshold: 500         
     gold-threshold: 2000          
 
-  # File Storage (Local / S3)
   storage:
     type: local                   
     local-path: ./uploads
     base-url: http://localhost:8080/api/files
 
-  # AI RAG
   ai:
     chunk-size: 800
     chunk-overlap: 100
     top-k-results: 5
 
-  # QUÊN MẬT KHẨU (MỚI THÊM)
+  # ========================
+  # CẤU HÌNH GỬI MAIL QUA BREVO API (MỚI)
+  # ========================
+  brevo:
+    api-key: ${BREVO_API_KEY:}
+    from-email: ${BREVO_FROM_EMAIL:admin@sme-erp.com}
+    from-name: ${BREVO_FROM_NAME:SME ERP & POS}
+
   frontend-url: ${FRONTEND_URL:http://localhost:5173}
-  mail:
-    sender-name: "SME ERP & POS"
   password-reset:
     token-ttl-minutes: 15
 
@@ -200,9 +182,6 @@ logging:
   pattern:
     console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr([%15.15t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n"
 
-# ========================
-# MANAGEMENT (Actuator)
-# ========================
 management:
   endpoints:
     web:
