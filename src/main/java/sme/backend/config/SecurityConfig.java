@@ -72,6 +72,9 @@ public class SecurityConfig {
                 .requestMatchers("/auth/**").permitAll()
                 .requestMatchers("/actuator/health").permitAll()
                 .requestMatchers("/api/ws/**", "/ws/**").permitAll()
+                // [MỚI] payOS gọi vào endpoint này khi có biến động số dư — không có JWT.
+                // BẮT BUỘC đứng TRƯỚC rule "/pos/**" bên dưới
+                .requestMatchers(HttpMethod.POST, "/pos/payments/webhook").permitAll()
 
                 // ── MODULE 0: POS & SHIFTS ───────────────────────────────
                 .requestMatchers("/pos/**")
@@ -148,7 +151,7 @@ public class SecurityConfig {
 
                 // ── NOTIFICATIONS ────────────────────────────────────────
                 .requestMatchers("/notifications/**")
-                    .hasAnyRole("CASHIER", "MANAGER", "ADMIN")
+                    .hasAnyRole("MANAGER", "ADMIN")
 
                 // ── SWAGGER / DOCS ───────────────────────────────────────
                 .requestMatchers(

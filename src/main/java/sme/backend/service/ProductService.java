@@ -1,4 +1,3 @@
-
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -77,11 +76,13 @@ public class ProductService {
         return mapToResponse(savedProduct, availableQty);
     }
 
+    // [FIX-A4] Hỗ trợ tìm kiếm chính xác theo Barcode hoặc SKU
     @Transactional(readOnly = true)
     @Cacheable(value = "products", key = "#barcode + '_' + (#warehouseId != null ? #warehouseId.toString() : 'ALL')")
     public ProductResponse getByBarcode(String barcode, UUID warehouseId) {
         Product product = productRepository.findByIsbnBarcodeAndIsActiveTrue(barcode)
-                .orElseThrow(() -> new ResourceNotFoundException("Không tìm thấy sản phẩm với mã vạch: " + barcode));
+                .or(() -> productRepository.findBySkuAndIsActiveTrue(barcode))
+                .orElseThrow(() -> new ResourceNotFoundException("Không tìm thấy sản phẩm với mã vạch/SKU: " + barcode));
         Integer available = null;
         if (warehouseId != null) {
             available = inventoryRepository.findByProductIdAndWarehouseId(product.getId(), warehouseId).map(inv -> inv.getAvailableQuantity()).orElse(0);
@@ -95,7 +96,6 @@ public class ProductService {
     @Transactional(readOnly = true)
     public Page<ProductResponse> search(String keyword, UUID categoryId, UUID supplierId, Boolean isActive, Pageable pageable) {
         
-        // Ép sang String để tránh lỗi bytea của PostgreSQL
         String catIdStr = categoryId != null ? categoryId.toString() : null;
         String supIdStr = supplierId != null ? supplierId.toString() : null;
         String isActiveStr = isActive != null ? isActive.toString() : null;
@@ -107,7 +107,6 @@ public class ProductService {
             return productPage.map(p -> mapToResponse(p, 0));
         }
 
-        // ... phần còn lại của hàm giữ nguyên
         List<UUID> categoryIds = productPage.getContent().stream()
                 .map(Product::getCategoryId).filter(Objects::nonNull).distinct().toList();
                 

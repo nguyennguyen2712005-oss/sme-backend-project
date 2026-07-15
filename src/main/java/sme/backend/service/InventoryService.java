@@ -1,4 +1,3 @@
-
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -35,6 +34,9 @@ public class InventoryService {
     private final PurchaseOrderRepository purchaseOrderRepository;
     private final InternalTransferRepository transferRepository;
     private final InvoiceRepository invoiceRepository;
+    
+    // ĐÃ THÊM: Inject UserRepository để tra cứu tên nhân viên
+    private final UserRepository userRepository;
 
     private int getSafeLowStockThreshold() {
         try {
@@ -223,9 +225,6 @@ public class InventoryService {
         } catch (Exception ignored) {}
     }
 
-    // ====================================================================================
-    // KHÔI PHỤC LẠI NGUYÊN BẢN: Cập nhật dựa trên inventoryId
-    // ====================================================================================
     @Transactional
     @CacheEvict(value = "inventories", allEntries = true)
     public void updateMinQuantity(UUID inventoryId, int newMinQuantity, String operator) {
@@ -281,8 +280,27 @@ public class InventoryService {
             dto.setBalance(txn.getQuantityAfter());
             dto.setNote(txn.getNote());
             dto.setCreatedAt(txn.getCreatedAt());
-            dto.setCreatedBy(txn.getCreatedBy());
             
+            // ---------------------------------------------------------
+            // ĐÃ SỬA LỖI: DỊCH UUID THÀNH HỌ TÊN NGƯỜI DÙNG TẠI ĐÂY
+            // ---------------------------------------------------------
+            String creator = txn.getCreatedBy();
+            if (creator != null && !creator.equals("SYSTEM")) {
+                try {
+                    // Thử ép kiểu chuỗi thành UUID
+                    UUID uid = UUID.fromString(creator);
+                    // Nếu thành công, tìm User trong DB và lấy Họ Tên
+                    creator = userRepository.findById(uid)
+                            .map(sme.backend.entity.User::getFullName)
+                            .orElse(creator);
+                } catch (Exception e) {
+                    // Nếu lỗi (nghĩa là chuỗi đang là "admin" hoặc "manager" chứ không phải UUID)
+                    // Thì bỏ qua, giữ nguyên chuỗi gốc
+                }
+            }
+            dto.setCreatedBy(creator);
+            // ---------------------------------------------------------
+
             if (txn.getReferenceId() != null) {
                 try {
                     switch (txn.getTransactionType()) {

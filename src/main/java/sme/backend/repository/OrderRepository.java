@@ -1,4 +1,3 @@
-
 package sme.backend.repository;
 
 import org.springframework.data.domain.Page;
@@ -71,13 +70,38 @@ public interface OrderRepository extends JpaRepository<Order, UUID> {
 
     Page<Order> findByAssignedWarehouseIdAndStatusOrderByCreatedAtDesc(UUID warehouseId, Order.OrderStatus status, Pageable pageable);
 
+    // ĐÃ SỬA: Dùng cờ boolean (hasWarehouse, hasDateFilter,...) thay vì kiểm tra IS NULL trực tiếp
+    // Cách này giúp vượt qua lỗi "could not determine data type of parameter" của PostgreSQL + Hibernate 6.
     @Query("""
         SELECT o FROM Order o
         WHERE o.paymentMethod = 'COD'
         AND o.status = 'DELIVERED'
         AND o.codReconciled = false
+        AND (:hasWarehouse = false OR o.assignedWarehouseId = :warehouseId)
+        AND (:keyword = ''
+             OR LOWER(o.code) LIKE LOWER(CONCAT('%', :keyword, '%'))
+             OR LOWER(o.trackingCode) LIKE LOWER(CONCAT('%', :keyword, '%'))
+             OR LOWER(o.shippingName) LIKE LOWER(CONCAT('%', :keyword, '%')))
+        AND (
+            :hasDateFilter = false
+            OR EXISTS (
+                SELECT 1 FROM OrderStatusHistory h
+                WHERE h.order = o AND h.newStatus = 'DELIVERED'
+                AND (:hasFrom = false OR h.createdAt >= :from)
+                AND (:hasTo = false OR h.createdAt <= :to)
+            )
+        )
+        ORDER BY o.updatedAt DESC
         """)
-    List<Order> findUnreconciledCODOrders();
+    Page<Order> searchUnreconciledCOD(@Param("hasWarehouse") boolean hasWarehouse,
+                                      @Param("warehouseId") UUID warehouseId,
+                                      @Param("hasDateFilter") boolean hasDateFilter,
+                                      @Param("hasFrom") boolean hasFrom,
+                                      @Param("from") Instant from,
+                                      @Param("hasTo") boolean hasTo,
+                                      @Param("to") Instant to,
+                                      @Param("keyword") String keyword,
+                                      Pageable pageable);
 
     List<Order> findByAssignedWarehouseIdIsNullAndStatus(Order.OrderStatus status);
 
@@ -90,7 +114,6 @@ public interface OrderRepository extends JpaRepository<Order, UUID> {
 
     // =========================================================================
     // TÌM KIẾM TOÀN HỆ THỐNG (ADMIN) VÀ THEO CHI NHÁNH (MANAGER/CASHIER)
-    // Dùng danh sách IN để tránh lỗi PostgreSQL Cast
     // =========================================================================
 
     @Query("""

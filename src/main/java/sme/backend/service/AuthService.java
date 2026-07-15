@@ -44,7 +44,6 @@ public class AuthService {
     private final WarehouseRepository warehouseRepository;
     private final PasswordEncoder passwordEncoder;
     
-    // [MỚI THÊM] Inject EmailService và RedisTemplate
     private final EmailService emailService;
     private final StringRedisTemplate stringRedisTemplate;
 
@@ -55,7 +54,7 @@ public class AuthService {
     private static final String RESET_COOLDOWN_PREFIX = "pwd-reset-cooldown:";
 
     // ─────────────────────────────────────────────────────────
-    // LOGIN
+    // LOGIN & REFRESH TOKEN
     // ─────────────────────────────────────────────────────────
     @Transactional
     public AuthResponse login(LoginRequest request) {
@@ -91,9 +90,6 @@ public class AuthService {
                 .build();
     }
 
-    // ─────────────────────────────────────────────────────────
-    // REFRESH TOKEN
-    // ─────────────────────────────────────────────────────────
     public AuthResponse refreshToken(String refreshToken) {
         if (!jwtTokenProvider.validateToken(refreshToken)) {
             throw new BusinessException("INVALID_TOKEN", "Refresh token không hợp lệ hoặc đã hết hạn");
@@ -116,26 +112,41 @@ public class AuthService {
     }
 
     // ─────────────────────────────────────────────────────────
-    // USER MANAGEMENT (ADMIN)
+    // USER MANAGEMENT (ADMIN & MANAGER)
     // ─────────────────────────────────────────────────────────
+    
+    private void verifyManagerAccess(UserPrincipal principal, User targetUser) {
+        if (principal.getRole() == User.UserRole.ROLE_MANAGER) {
+            if (!principal.getWarehouseId().equals(targetUser.getWarehouseId())) {
+                throw new BusinessException("ACCESS_DENIED", "Bạn chỉ được thao tác trên nhân sự thuộc chi nhánh của mình.");
+            }
+        }
+    }
+
     @Transactional
-    public UserResponse createUser(CreateUserRequest req) {
+    public UserResponse createUser(CreateUserRequest req, UserPrincipal principal) {
         if (userRepository.existsByUsername(req.getUsername())) {
-            throw new BusinessException("DUPLICATE_USERNAME",
-                    "Tên đăng nhập '" + req.getUsername() + "' đã tồn tại");
+            throw new BusinessException("DUPLICATE_USERNAME", "Tên đăng nhập '" + req.getUsername() + "' đã tồn tại");
         }
 
         User.UserRole role;
         try {
             role = User.UserRole.valueOf(req.getRole());
         } catch (IllegalArgumentException e) {
-            throw new BusinessException("INVALID_ROLE",
-                    "Role không hợp lệ: " + req.getRole());
+            throw new BusinessException("INVALID_ROLE", "Role không hợp lệ: " + req.getRole());
         }
 
-        if (role != User.UserRole.ROLE_ADMIN && req.getWarehouseId() == null) {
-            throw new BusinessException("WAREHOUSE_REQUIRED",
-                    "Manager và Cashier phải được gán vào một chi nhánh");
+        UUID effectiveWarehouseId = req.getWarehouseId();
+
+        if (principal.getRole() == User.UserRole.ROLE_MANAGER) {
+            if (role != User.UserRole.ROLE_CASHIER) {
+                throw new BusinessException("ACCESS_DENIED", "Quản lý chi nhánh chỉ được phép tạo tài khoản Thu ngân.");
+            }
+            effectiveWarehouseId = principal.getWarehouseId();
+        }
+
+        if (role != User.UserRole.ROLE_ADMIN && effectiveWarehouseId == null) {
+            throw new BusinessException("WAREHOUSE_REQUIRED", "Manager và Cashier phải được gán vào một chi nhánh");
         }
 
         User user = User.builder()
@@ -145,45 +156,85 @@ public class AuthService {
                 .email(req.getEmail())
                 .phone(req.getPhone())
                 .role(role)
-                .warehouseId(req.getWarehouseId())
+                .warehouseId(effectiveWarehouseId)
                 .isActive(true)
                 .build();
 
         user = userRepository.save(user);
-        log.info("Created user: {} with role: {}", user.getUsername(), user.getRole());
+        log.info("Created user: {} with role: {} by {}", user.getUsername(), user.getRole(), principal.getUsername());
         return mapToResponse(user);
     }
 
     @Transactional(readOnly = true)
-    public List<UserResponse> searchUsers(String keyword, String roleStr, UUID warehouseId) {
+    public List<UserResponse> searchUsers(String keyword, String roleStr, UUID warehouseId, UserPrincipal principal) {
+        UUID effectiveWarehouseId = warehouseId;
+        if (principal.getRole() == User.UserRole.ROLE_MANAGER) {
+            effectiveWarehouseId = principal.getWarehouseId();
+        }
+        final UUID finalWid = effectiveWarehouseId;
+
         return userRepository.findAll(Sort.by("fullName")).stream()
                 .filter(u -> keyword == null || keyword.isBlank() ||
                         u.getFullName().toLowerCase().contains(keyword.toLowerCase()) ||
                         u.getUsername().toLowerCase().contains(keyword.toLowerCase()) ||
                         (u.getEmail() != null && u.getEmail().toLowerCase().contains(keyword.toLowerCase())))
                 .filter(u -> roleStr == null || roleStr.isBlank() || u.getRole().name().equals(roleStr))
-                .filter(u -> warehouseId == null || warehouseId.equals(u.getWarehouseId()))
+                .filter(u -> finalWid == null || finalWid.equals(u.getWarehouseId()))
                 .map(this::mapToResponse)
                 .toList();
     }
 
     @Transactional
-    public UserResponse updateUser(UUID id, CreateUserRequest req) {
+    public UserResponse updateUser(UUID id, CreateUserRequest req, UserPrincipal principal) {
         User user = userRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("User", id));
+
+        verifyManagerAccess(principal, user);
 
         if (req.getFullName() != null) user.setFullName(req.getFullName());
         if (req.getEmail() != null) user.setEmail(req.getEmail());
         if (req.getPhone() != null) user.setPhone(req.getPhone());
-        if (req.getRole() != null) user.setRole(User.UserRole.valueOf(req.getRole()));
-        if (req.getWarehouseId() != null) user.setWarehouseId(req.getWarehouseId());
-        
         if (req.getPosSettings() != null) user.setPosSettings(req.getPosSettings());
+
+        if (req.getRole() != null) {
+            User.UserRole newRole = User.UserRole.valueOf(req.getRole());
+            if (principal.getRole() == User.UserRole.ROLE_MANAGER) {
+                if (user.getId().equals(principal.getId()) && newRole != User.UserRole.ROLE_MANAGER) {
+                    throw new BusinessException("ACCESS_DENIED", "Bạn không thể tự thay đổi chức vụ của chính mình.");
+                }
+                if (!user.getId().equals(principal.getId()) && newRole != User.UserRole.ROLE_CASHIER) {
+                    throw new BusinessException("ACCESS_DENIED", "Bạn chỉ được phép cấp quyền Thu ngân cho nhân viên.");
+                }
+            }
+            user.setRole(newRole);
+        }
+
+        if (req.getWarehouseId() != null) {
+            if (principal.getRole() == User.UserRole.ROLE_MANAGER && !req.getWarehouseId().equals(principal.getWarehouseId())) {
+                throw new BusinessException("ACCESS_DENIED", "Bạn không thể chuyển nhân sự sang chi nhánh khác.");
+            }
+            user.setWarehouseId(req.getWarehouseId());
+        }
 
         if (req.getPassword() != null && !req.getPassword().isBlank()) {
             user.setPasswordHash(passwordEncoder.encode(req.getPassword()));
         }
         
+        return mapToResponse(userRepository.save(user));
+    }
+
+    @Transactional
+    public UserResponse toggleUserActive(UUID userId, boolean active, UserPrincipal principal) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
+
+        verifyManagerAccess(principal, user);
+
+        if (principal.getRole() == User.UserRole.ROLE_MANAGER && user.getId().equals(principal.getId()) && !active) {
+            throw new BusinessException("ACCESS_DENIED", "Bạn không thể tự khóa tài khoản của chính mình.");
+        }
+
+        user.setIsActive(active);
         return mapToResponse(userRepository.save(user));
     }
 
@@ -199,21 +250,13 @@ public class AuthService {
         userRepository.save(user);
     }
 
-    @Transactional
-    public UserResponse toggleUserActive(UUID userId, boolean active) {
-        User user = userRepository.findById(userId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setIsActive(active);
-        return mapToResponse(userRepository.save(user));
-    }
-
     public List<UserResponse> getAllUsers() {
         return userRepository.findAllActive().stream()
                 .map(this::mapToResponse).toList();
     }
 
     // ─────────────────────────────────────────────────────────
-    // QUÊN MẬT KHẨU (MỚI THÊM)
+    // QUÊN MẬT KHẨU
     // ─────────────────────────────────────────────────────────
     @Transactional(readOnly = true)
     public void forgotPassword(String email) {
@@ -221,7 +264,7 @@ public class AuthService {
             String cooldownKey = RESET_COOLDOWN_PREFIX + user.getId();
             if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(cooldownKey))) {
                 log.info("Bỏ qua yêu cầu quên mật khẩu (đang trong cooldown) cho user: {}", user.getId());
-                return; // im lặng, không lộ thông tin, tránh spam gửi mail
+                return; 
             }
 
             String token = java.util.UUID.randomUUID().toString().replace("-", "")
@@ -237,9 +280,6 @@ public class AuthService {
 
             log.info("Đã tạo token đặt lại mật khẩu cho user: {}", user.getId());
         }, () -> log.info("Yêu cầu quên mật khẩu cho email không tồn tại/không active: {}", email));
-
-        // Không throw exception, không phân biệt email tồn tại hay không —
-        // tránh lộ thông tin cho kẻ tấn công dò email hợp lệ trong hệ thống.
     }
 
     @Transactional
@@ -258,7 +298,7 @@ public class AuthService {
         user.setPasswordHash(passwordEncoder.encode(req.getNewPassword()));
         userRepository.save(user);
 
-        stringRedisTemplate.delete(redisKey); // dùng 1 lần rồi xóa ngay
+        stringRedisTemplate.delete(redisKey); 
         log.info("Đặt lại mật khẩu thành công cho user: {}", user.getId());
     }
 

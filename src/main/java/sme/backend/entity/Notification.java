@@ -1,4 +1,3 @@
-
 package sme.backend.entity;
 
 import jakarta.persistence.*;
@@ -18,6 +17,10 @@ public class Notification extends BaseSimpleEntity {
 
     @Column(name = "user_id")
     private UUID userId;
+
+    // ĐÃ THÊM: Lưu thông tin chi nhánh cho các thông báo hệ thống (broadcast)
+    @Column(name = "warehouse_id")
+    private UUID warehouseId;
 
     /**
      * LOW_STOCK         → Tồn kho thấp

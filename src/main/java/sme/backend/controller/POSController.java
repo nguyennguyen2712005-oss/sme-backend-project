@@ -20,8 +20,10 @@ import sme.backend.repository.InvoiceRepository;
 import sme.backend.security.UserPrincipal;
 import sme.backend.service.POSService;
 import sme.backend.service.ShiftService;
+import sme.backend.service.PaymentTransactionService;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @RestController
@@ -32,6 +34,7 @@ public class POSController {
     private final ShiftService shiftService;
     private final POSService posService;
     private final InvoiceRepository invoiceRepository;
+    private final PaymentTransactionService paymentTransactionService; // [MỚI]
 
     // ─── Mở ca ───────────────────────────────────────────────
     @PostMapping("/shifts/open")
@@ -57,9 +60,6 @@ public class POSController {
 
         ShiftResponse shift = shiftService.closeShift(principal.getId(), req);
 
-        // [FIX-3] Blind Close: Thu ngân KHÔNG được biết số tiền lý thuyết và
-        // chênh lệch ngay sau khi đóng ca. Chỉ Manager/Admin thấy được sau khi duyệt.
-        // Mask tại Controller — data không bao giờ rời server đến Client Cashier.
         if (principal.getRole() == User.UserRole.ROLE_CASHIER) {
             shift.setTheoreticalCash(null);
             shift.setDiscrepancyAmount(null);
@@ -75,7 +75,6 @@ public class POSController {
             @AuthenticationPrincipal UserPrincipal principal) {
         try {
             var shift = shiftService.getOpenShiftByCashier(principal.getId());
-            // Thu ngân xem trạng thái ca ĐANG MỞ — không cần mask (chưa có theoretical)
             return ResponseEntity.ok(ApiResponse.ok(shiftService.mapToResponse(shift)));
         } catch (BusinessException e) {
             return ResponseEntity.ok(ApiResponse.ok(null));
@@ -83,32 +82,16 @@ public class POSController {
     }
 
     // ─── Ca chờ duyệt ────────────────────────────────────────
-    /**
-     * [FIX-6] Admin cần truyền warehouseId = null để xem toàn bộ.
-     * ShiftService.getPendingShifts(null) giờ dùng findAllByStatus() thay vì
-     * findByWarehouseIdAndStatus(null, CLOSED) mà trước đây trả về rỗng.
-     */
     @GetMapping("/shifts/pending")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<List<ShiftResponse>>> getPendingShifts(
             @AuthenticationPrincipal UserPrincipal principal) {
-        // Admin: warehouseId = null → xem tất cả chi nhánh
-        // Manager: warehouseId = chi nhánh của mình
         UUID warehouseId = (principal.getRole() == User.UserRole.ROLE_ADMIN)
                 ? null : principal.getWarehouseId();
         return ResponseEntity.ok(ApiResponse.ok(shiftService.getPendingShifts(warehouseId)));
     }
 
     // ─── Duyệt ca ────────────────────────────────────────────
-    /**
-     * [FIX-5] Truyền thêm warehouseId và role của người duyệt vào ShiftService
-     * để Service kiểm tra Manager không duyệt ca của chi nhánh khác.
-     *
-     * [FIX-ADMIN-SPEC] Chỉ MANAGER được duyệt ca — Admin ngồi trụ sở không thể
-     * kiểm đếm tiền mặt thực tế thay Manager chi nhánh. Trước đây endpoint này
-     * cho phép cả ADMIN, vi phạm Admin spec mục II "NHỮNG VIỆC ADMIN BỊ CẤM LÀM"
-     * ("Không được Duyệt chốt ca — Admin chỉ xem báo cáo, không bấm nút duyệt thay").
-     */
     @PostMapping("/shifts/{id}/approve")
     @PreAuthorize("hasRole('MANAGER')")
     public ResponseEntity<ApiResponse<ShiftResponse>> approveShift(
@@ -117,7 +100,7 @@ public class POSController {
         ShiftResponse shift = shiftService.approveShift(
                 id,
                 principal.getId(),
-                principal.getWarehouseId(),  // null nếu là Admin
+                principal.getWarehouseId(),  
                 principal.getRole());
         return ResponseEntity.ok(ApiResponse.ok("Duyệt ca thành công", shift));
     }
@@ -178,33 +161,11 @@ public class POSController {
         return ResponseEntity.ok(ApiResponse.ok(PageResponse.of(mapped)));
     }
 
+    // [FIX-A3] Rút gọn, uỷ quyền cho Service xử lý để lấy đủ tên SP/Khách hàng
     @GetMapping("/invoices/code/{code}")
     @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<InvoiceResponse>> getInvoiceByCode(@PathVariable String code) {
-        var invoice = invoiceRepository.findByCode(code)
-                .orElseThrow(() -> new sme.backend.exception.ResourceNotFoundException(
-                        "Không tìm thấy hóa đơn mã: " + code));
-
-        List<InvoiceResponse.ItemResponse> items = invoice.getItems().stream()
-                .map(i -> InvoiceResponse.ItemResponse.builder()
-                        .productId(i.getProductId())
-                        .quantity(i.getQuantity())
-                        .unitPrice(i.getUnitPrice())
-                        .macPrice(i.getMacPrice())
-                        .subtotal(i.getSubtotal())
-                        .build()).toList();
-
-        return ResponseEntity.ok(ApiResponse.ok(
-                InvoiceResponse.builder()
-                        .id(invoice.getId())
-                        .code(invoice.getCode())
-                        .type(invoice.getType().name())
-                        .totalAmount(invoice.getTotalAmount())
-                        .finalAmount(invoice.getFinalAmount())
-                        .createdAt(invoice.getCreatedAt())
-                        .items(items)
-                        .build()
-        ));
+        return ResponseEntity.ok(ApiResponse.ok(posService.getInvoiceByCode(code)));
     }
 
     // ─── Trả hàng ─────────────────────────────────────────────
@@ -243,5 +204,40 @@ public class POSController {
                 principal.getWarehouseId(), req.getNote());
 
         return ResponseEntity.ok(ApiResponse.ok("Trả hàng thành công", invoice));
+    }
+
+    // ─── [MỚI] Thanh toán QR payOS ───────────────────────────
+    @PostMapping("/payments/qr")
+    @PreAuthorize("hasAnyRole('CASHIER','MANAGER')")
+    public ResponseEntity<ApiResponse<sme.backend.dto.response.PaymentQrResponse>> createPaymentQr(
+            @AuthenticationPrincipal UserPrincipal principal,
+            @RequestBody CheckoutRequest req) {
+
+        if (principal.getWarehouseId() == null) {
+            throw new BusinessException("NO_WAREHOUSE", "Tài khoản chưa được gán chi nhánh");
+        }
+        var qr = paymentTransactionService.createQr(req, principal.getId(), principal.getWarehouseId());
+        return ResponseEntity.ok(ApiResponse.ok(qr));
+    }
+
+    @GetMapping("/payments/{code}/status")
+    @PreAuthorize("hasAnyRole('CASHIER','MANAGER')")
+    public ResponseEntity<ApiResponse<sme.backend.dto.response.PaymentQrResponse>> getPaymentStatus(
+            @PathVariable String code) {
+        return ResponseEntity.ok(ApiResponse.ok(paymentTransactionService.getStatus(code)));
+    }
+
+    @PostMapping("/payments/{code}/cancel")
+    @PreAuthorize("hasAnyRole('CASHIER','MANAGER')")
+    public ResponseEntity<ApiResponse<Void>> cancelPaymentQr(@PathVariable String code) {
+        paymentTransactionService.cancel(code);
+        return ResponseEntity.ok(ApiResponse.ok("Đã huỷ giao dịch", null));
+    }
+
+    // [PUBLIC] payOS gọi endpoint này khi có biến động số dư — KHÔNG qua JWT.
+    @PostMapping("/payments/webhook")
+    public ResponseEntity<Map<String, Object>> payosWebhook(@RequestBody Map<String, Object> payload) {
+        paymentTransactionService.handleWebhook(payload);
+        return ResponseEntity.ok(Map.of("success", true));
     }
 }

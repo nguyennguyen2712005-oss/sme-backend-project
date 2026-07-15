@@ -94,45 +94,54 @@ public class AuthController {
 
     // ── User Management (ADMIN only) ──────────────────────────
 
+// ── User Management (ADMIN & MANAGER) ──────────────────────────
+
     /** POST /auth/users */
     @PostMapping("/users")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
     public ResponseEntity<ApiResponse<UserResponse>> createUser(
-            @Valid @RequestBody CreateUserRequest req) {
+            @Valid @RequestBody CreateUserRequest req,
+            @AuthenticationPrincipal UserPrincipal principal) { // Thêm principal
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(ApiResponse.created(authService.createUser(req)));
+                .body(ApiResponse.created(authService.createUser(req, principal)));
     }
 
     /** PATCH /auth/users/{id}/activate */
     @PatchMapping("/users/{id}/activate")
-    @PreAuthorize("hasRole('ADMIN')")
-    public ResponseEntity<ApiResponse<UserResponse>> activateUser(@PathVariable UUID id) {
-        return ResponseEntity.ok(ApiResponse.ok(authService.toggleUserActive(id, true)));
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
+    public ResponseEntity<ApiResponse<UserResponse>> activateUser(
+            @PathVariable UUID id,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(authService.toggleUserActive(id, true, principal)));
     }
 
     /** PATCH /auth/users/{id}/deactivate */
     @PatchMapping("/users/{id}/deactivate")
-    @PreAuthorize("hasRole('ADMIN')")
-    public ResponseEntity<ApiResponse<UserResponse>> deactivateUser(@PathVariable UUID id) {
-        return ResponseEntity.ok(ApiResponse.ok(authService.toggleUserActive(id, false)));
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
+    public ResponseEntity<ApiResponse<UserResponse>> deactivateUser(
+            @PathVariable UUID id,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(authService.toggleUserActive(id, false, principal)));
     }
     
     /** GET /auth/users */
     @GetMapping("/users")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
     public ResponseEntity<ApiResponse<List<UserResponse>>> getAllUsers(
             @RequestParam(required = false) String keyword,
             @RequestParam(required = false) String role,
-            @RequestParam(required = false) UUID warehouseId) {
-        return ResponseEntity.ok(ApiResponse.ok(authService.searchUsers(keyword, role, warehouseId)));
+            @RequestParam(required = false) UUID warehouseId,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(authService.searchUsers(keyword, role, warehouseId, principal)));
     }
 
     /** PUT /auth/users/{id} */
     @PutMapping("/users/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
     public ResponseEntity<ApiResponse<UserResponse>> updateUser(
             @PathVariable UUID id, 
-            @RequestBody CreateUserRequest req) {
-        return ResponseEntity.ok(ApiResponse.ok(authService.updateUser(id, req)));
+            @RequestBody CreateUserRequest req,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(authService.updateUser(id, req, principal)));
     }
 }

@@ -1,4 +1,3 @@
-
 package sme.backend.repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -24,4 +23,18 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
 
     @Query("SELECT COUNT(n) FROM Notification n WHERE n.userId IS NULL AND n.isRead = false")
     long countByUserIdIsNullAndIsReadFalse();
+
+    // =========================================================================
+    // ĐÃ THÊM: QUERIES DÀNH RIÊNG CHO MANAGER
+    // Manager thấy thông báo cá nhân LẪN thông báo chung của đúng chi nhánh mình
+    // =========================================================================
+
+    @Query("SELECT n FROM Notification n WHERE n.isRead = false AND " +
+           "(n.userId = :userId OR (n.userId IS NULL AND n.warehouseId = :warehouseId)) " +
+           "ORDER BY n.createdAt DESC")
+    List<Notification> findUnreadForManager(@Param("userId") UUID userId, @Param("warehouseId") UUID warehouseId);
+
+    @Query("SELECT COUNT(n) FROM Notification n WHERE n.isRead = false AND " +
+           "(n.userId = :userId OR (n.userId IS NULL AND n.warehouseId = :warehouseId))")
+    long countUnreadForManager(@Param("userId") UUID userId, @Param("warehouseId") UUID warehouseId);
 }

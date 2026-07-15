@@ -165,6 +165,14 @@ app:
     from-email: ${BREVO_FROM_EMAIL:admin@sme-erp.com}
     from-name: ${BREVO_FROM_NAME:SME ERP & POS}
 
+  # ========================
+  # CẤU HÌNH THANH TOÁN PAYOS (MỚI)
+  # ========================
+  payos:
+    client-id: ${PAYOS_CLIENT_ID:}
+    api-key: ${PAYOS_API_KEY:}
+    checksum-key: ${PAYOS_CHECKSUM_KEY:}
+
   frontend-url: ${FRONTEND_URL:http://localhost:5173}
   password-reset:
     token-ttl-minutes: 15

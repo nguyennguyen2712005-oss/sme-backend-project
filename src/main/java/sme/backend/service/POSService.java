@@ -17,17 +17,6 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.*;
 
-/**
- * POSService — Final version với đầy đủ:
- *  [FIX-1] Ngăn double refund
- *  [FIX-2] Inventory transaction dùng invoiceId thực
- *  [FIX-8] Refund kiểm tra warehouse
- *  [NEW]   Tích hợp Mã Khuyến mãi (Promotion)
- *
- * Thứ tự ưu tiên discount:
- *   1. Mã khuyến mãi (promotionCode) — áp dụng trước
- *   2. Điểm tích lũy (pointsToUse)  — áp dụng sau, tính trên giá còn lại
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -41,8 +30,9 @@ public class POSService {
     private final ProductRepository productRepository;
     private final CashbookTransactionRepository cashbookRepository;
     private final AppProperties appProperties;
-    private final PromotionService promotionService; // [NEW]
-    private final CodeGeneratorService codeGenerator; // [FIX-7] PostgreSQL sequence, tránh trùng mã khi concurrent
+    private final PromotionService promotionService; 
+    private final CodeGeneratorService codeGenerator; 
+    private final UserRepository userRepository; // [FIX A3] để lấy fullName của cashier
 
     // ─────────────────────────────────────────────────────────
     // CHECKOUT
@@ -80,47 +70,16 @@ public class POSService {
             }
         }
 
-        // 4. Tính tổng tiền trước discount
-        BigDecimal totalAmount = req.getItems().stream()
-                .map(item -> item.getUnitPrice()
-                        .multiply(BigDecimal.valueOf(item.getQuantity())))
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        // ── TÍNH DISCOUNT (Promotions + Loyalty Points) ──────
-        BigDecimal promotionDiscount = BigDecimal.ZERO;
-        BigDecimal loyaltyDiscount   = BigDecimal.ZERO;
+        // 4-5. Tính tiền — dùng chung với previewFinalAmount() ở luồng tạo QR payOS.
+        // commitPromotionUsage = true vì đây là checkout THẬT, cần tăng usedCount ngay.
         int pointsToUse = req.getPointsToUse() != null ? req.getPointsToUse() : 0;
         String promotionCode = req.getPromotionCode();
+        PricingResult pricing = computePricing(
+                req.getItems(), customer, pointsToUse, promotionCode, true);
 
-        // A. [NEW] Mã khuyến mãi (ưu tiên 1)
-        if (promotionCode != null && !promotionCode.isBlank()) {
-            // applyPromotion() vừa validate vừa tăng usedCount (atomic via @Modifying)
-            promotionDiscount = promotionService.applyPromotion(
-                    promotionCode.trim(), totalAmount, "POS");
-        }
-
-        // B. Điểm tích lũy (ưu tiên 2 — tính trên giá sau mã KM)
-        BigDecimal afterPromotion = totalAmount.subtract(promotionDiscount);
-        if (pointsToUse > 0 && customer != null) {
-            if (pointsToUse % 500 != 0) {
-                throw new BusinessException("INVALID_POINTS",
-                        "Chỉ có thể quy đổi điểm theo mốc 500 điểm.");
-            }
-            if (customer.getLoyaltyPoints() < pointsToUse) {
-                throw new BusinessException("INSUFFICIENT_POINTS",
-                        "Điểm tích lũy không đủ. Hiện có: " + customer.getLoyaltyPoints());
-            }
-            loyaltyDiscount = BigDecimal.valueOf(pointsToUse)
-                    .multiply(BigDecimal.valueOf(
-                            appProperties.getBusiness().getLoyaltyPointsRedeemValue()));
-            if (loyaltyDiscount.compareTo(afterPromotion) > 0) {
-                loyaltyDiscount = afterPromotion;
-            }
-        }
-
-        BigDecimal discountAmount = promotionDiscount.add(loyaltyDiscount);
-        BigDecimal finalAmount    = totalAmount.subtract(discountAmount);
-        // ─────────────────────────────────────────────────────
+        BigDecimal totalAmount    = pricing.totalAmount();
+        BigDecimal discountAmount = pricing.discountAmount();
+        BigDecimal finalAmount    = pricing.finalAmount();
 
         // 5. Validate tổng tiền thanh toán
         BigDecimal totalPaid = req.getPayments().stream()
@@ -135,7 +94,7 @@ public class POSService {
         // 6. Build Invoice
         String invoiceNote = buildNote(req.getNote(), promotionCode, pointsToUse);
         Invoice invoice = Invoice.builder()
-                .code(codeGenerator.nextInvoiceCode()) // [FIX-7]
+                .code(codeGenerator.nextInvoiceCode()) 
                 .shiftId(shift.getId())
                 .customerId(customer != null ? customer.getId() : null)
                 .type(Invoice.InvoiceType.SALE)
@@ -171,7 +130,7 @@ public class POSService {
                     .method(method).amount(p.getAmount()).reference(p.getReference()).build());
         }
 
-        // [FIX-2] Lưu Invoice TRƯỚC để có invoiceId thực
+        // Lưu Invoice TRƯỚC để có invoiceId thực
         invoice = invoiceRepository.save(invoice);
         final UUID invoiceId = invoice.getId();
 
@@ -205,13 +164,13 @@ public class POSService {
             invoice = invoiceRepository.save(invoice);
         }
 
-        log.info("Checkout OK: invoice={}, total={}, discount={} (promo={}/points={}), cashier={}",
-                invoice.getCode(), totalAmount, discountAmount, promotionDiscount, loyaltyDiscount, cashierId);
+        log.info("Checkout OK: invoice={}, total={}, discount={}, cashier={}",
+                invoice.getCode(), totalAmount, discountAmount, cashierId);
         return buildInvoiceResponse(invoice);
     }
 
     // ─────────────────────────────────────────────────────────
-    // REFUND — giữ nguyên từ Step 1 fix
+    // REFUND 
     // ─────────────────────────────────────────────────────────
     @Transactional
     public InvoiceResponse refund(UUID originalInvoiceId, UUID shiftId,
@@ -229,7 +188,7 @@ public class POSService {
                     "Không thể tạo trả hàng cho hóa đơn trả hàng");
         }
 
-        // [FIX-1] Double refund check
+        // Double refund check
         List<Invoice> existingReturns = invoiceRepository
                 .findReturnInvoicesWithItemsByReturnOfId(originalInvoiceId);
         Map<UUID, Integer> alreadyReturnedQty = new HashMap<>();
@@ -257,7 +216,7 @@ public class POSService {
 
         // Phase 1: Build return invoice
         Invoice returnInvoice = Invoice.builder()
-                .code(codeGenerator.nextReturnCode()) // [FIX-7]
+                .code(codeGenerator.nextReturnCode()) 
                 .shiftId(shiftId)
                 .customerId(original.getCustomerId())
                 .type(Invoice.InvoiceType.RETURN)
@@ -285,7 +244,6 @@ public class POSService {
         returnInvoice.setTotalAmount(totalRefund);
         returnInvoice.setFinalAmount(totalRefund);
 
-        // [FIX-REFUND-REF] Lưu trước để lấy returnInvoiceId thực
         returnInvoice = invoiceRepository.save(returnInvoice);
         final UUID returnInvoiceId = returnInvoice.getId();
 
@@ -316,6 +274,137 @@ public class POSService {
     // ─────────────────────────────────────────────────────────
     // HELPERS
     // ─────────────────────────────────────────────────────────
+
+    /** Kết quả tính tiền — dùng chung cho cả checkout() thật và preview QR payOS. */
+    private record PricingResult(BigDecimal totalAmount, BigDecimal promotionDiscount,
+                                  BigDecimal loyaltyDiscount, BigDecimal discountAmount,
+                                  BigDecimal finalAmount) {}
+
+    /**
+     * [FIX-SECURITY] Tính tiền tập trung tại MỘT nơi duy nhất, luôn dựa trên dữ
+     * liệu đã validate ở Server (items, mã khuyến mãi, điểm) — KHÔNG BAO GIỜ tin
+     * số tiền do Client tự tính rồi gửi lên.
+     *
+     * @param commitPromotionUsage true = tăng usedCount ngay (checkout thật);
+     *                             false = chỉ xem trước, không đổi dữ liệu (tạo QR payOS).
+     */
+    private PricingResult computePricing(List<CheckoutRequest.CartItemRequest> items,
+                                          Customer customer, int pointsToUse,
+                                          String promotionCode, boolean commitPromotionUsage) {
+
+        BigDecimal totalAmount = items.stream()
+                .map(item -> item.getUnitPrice().multiply(BigDecimal.valueOf(item.getQuantity())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal promotionDiscount = BigDecimal.ZERO;
+        if (promotionCode != null && !promotionCode.isBlank()) {
+            promotionDiscount = commitPromotionUsage
+                    ? promotionService.applyPromotion(promotionCode.trim(), totalAmount, "POS")
+                    : promotionService.validateCode(promotionCode.trim(), totalAmount, "POS").getDiscountAmount();
+        }
+
+        BigDecimal afterPromotion = totalAmount.subtract(promotionDiscount);
+        BigDecimal loyaltyDiscount = BigDecimal.ZERO;
+        if (pointsToUse > 0 && customer != null) {
+            if (pointsToUse % 500 != 0) {
+                throw new BusinessException("INVALID_POINTS", "Chỉ có thể quy đổi điểm theo mốc 500 điểm.");
+            }
+            if (customer.getLoyaltyPoints() < pointsToUse) {
+                throw new BusinessException("INSUFFICIENT_POINTS",
+                        "Điểm tích lũy không đủ. Hiện có: " + customer.getLoyaltyPoints());
+            }
+            loyaltyDiscount = BigDecimal.valueOf(pointsToUse)
+                    .multiply(BigDecimal.valueOf(appProperties.getBusiness().getLoyaltyPointsRedeemValue()));
+            if (loyaltyDiscount.compareTo(afterPromotion) > 0) {
+                loyaltyDiscount = afterPromotion;
+            }
+        }
+
+        BigDecimal discountAmount = promotionDiscount.add(loyaltyDiscount);
+        BigDecimal finalAmount = totalAmount.subtract(discountAmount);
+        return new PricingResult(totalAmount, promotionDiscount, loyaltyDiscount, discountAmount, finalAmount);
+    }
+
+    /**
+     * [MỚI] Tính trước finalAmount cho luồng tạo QR payOS — public để
+     * PaymentTransactionService gọi được. readOnly vì không được có side-effect.
+     */
+    @Transactional(readOnly = true)
+    public BigDecimal previewFinalAmount(List<CheckoutRequest.CartItemRequest> items, Customer customer,
+                                          int pointsToUse, String promotionCode) {
+        return computePricing(items, customer, pointsToUse, promotionCode, false).finalAmount();
+    }
+
+    /**
+     * [FIX-A3] Map InvoiceItem -> ItemResponse kèm tên sản phẩm thật.
+     */
+    private List<InvoiceResponse.ItemResponse> buildItemResponses(List<InvoiceItem> items) {
+        if (items == null || items.isEmpty()) return List.of();
+
+        Map<UUID, Product> productMap = productRepository
+                .findAllById(items.stream().map(InvoiceItem::getProductId).distinct().toList())
+                .stream()
+                .collect(java.util.stream.Collectors.toMap(Product::getId, p -> p));
+
+        return items.stream().map(i -> {
+            Product p = productMap.get(i.getProductId());
+            return InvoiceResponse.ItemResponse.builder()
+                    .productId(i.getProductId())
+                    .productName(p != null ? p.getName() : "Sản phẩm đã xoá")
+                    .isbnBarcode(p != null ? p.getIsbnBarcode() : null)
+                    .quantity(i.getQuantity())
+                    .unitPrice(i.getUnitPrice())
+                    .macPrice(i.getMacPrice())
+                    .subtotal(i.getSubtotal())
+                    .build();
+        }).toList();
+    }
+
+    private InvoiceResponse buildInvoiceResponse(Invoice invoice) {
+        List<InvoiceResponse.ItemResponse> items = buildItemResponses(invoice.getItems());
+
+        List<InvoiceResponse.PaymentResponse> payments = invoice.getPayments() == null ? List.of()
+                : invoice.getPayments().stream().map(p -> InvoiceResponse.PaymentResponse.builder()
+                        .method(p.getMethod().name()).amount(p.getAmount())
+                        .reference(p.getReference()).build()).toList();
+
+        // [FIX-A3] Lấy tên Thu ngân và Khách hàng
+        String cashierName = userRepository.findById(invoice.getCashierId())
+                .map(User::getFullName).orElse(null);
+
+        String customerName = null;
+        String customerPhone = null;
+        if (invoice.getCustomerId() != null) {
+            Customer c = customerRepository.findById(invoice.getCustomerId()).orElse(null);
+            if (c != null) {
+                customerName = c.getFullName();
+                customerPhone = c.getPhoneNumber();
+            }
+        }
+
+        return InvoiceResponse.builder()
+                .id(invoice.getId()).code(invoice.getCode())
+                .shiftId(invoice.getShiftId()).customerId(invoice.getCustomerId())
+                .returnOfId(invoice.getReturnOfId()).type(invoice.getType().name())
+                .totalAmount(invoice.getTotalAmount()).discountAmount(invoice.getDiscountAmount())
+                .finalAmount(invoice.getFinalAmount()).pointsUsed(invoice.getPointsUsed())
+                .pointsEarned(invoice.getPointsEarned()).note(invoice.getNote())
+                .cashierName(cashierName)
+                .customerName(customerName)
+                .customerPhone(customerPhone)
+                .createdAt(invoice.getCreatedAt()).items(items).payments(payments).build();
+    }
+
+    /**
+     * [FIX-A3] Chuyển logic tra cứu hóa đơn theo mã từ Controller vào Service
+     */
+    @Transactional(readOnly = true)
+    public InvoiceResponse getInvoiceByCode(String code) {
+        Invoice invoice = invoiceRepository.findByCodeWithDetails(code)
+                .orElseThrow(() -> new ResourceNotFoundException("Không tìm thấy hóa đơn mã: " + code));
+        return buildInvoiceResponse(invoice);
+    }
+
     private void recordCashbook(Shift shift, InvoicePayment.PaymentMethod method,
                                  BigDecimal amount, UUID warehouseId) {
         CashbookTransaction.FundType fundType =
@@ -341,26 +430,6 @@ public class POSService {
         }
         if (baseNote != null && !baseNote.isBlank()) sb.append(baseNote);
         return sb.toString().trim();
-    }
-
-    private InvoiceResponse buildInvoiceResponse(Invoice invoice) {
-        List<InvoiceResponse.ItemResponse> items = invoice.getItems() == null ? List.of()
-                : invoice.getItems().stream().map(i -> InvoiceResponse.ItemResponse.builder()
-                        .productId(i.getProductId()).quantity(i.getQuantity())
-                        .unitPrice(i.getUnitPrice()).macPrice(i.getMacPrice())
-                        .subtotal(i.getSubtotal()).build()).toList();
-        List<InvoiceResponse.PaymentResponse> payments = invoice.getPayments() == null ? List.of()
-                : invoice.getPayments().stream().map(p -> InvoiceResponse.PaymentResponse.builder()
-                        .method(p.getMethod().name()).amount(p.getAmount())
-                        .reference(p.getReference()).build()).toList();
-        return InvoiceResponse.builder()
-                .id(invoice.getId()).code(invoice.getCode())
-                .shiftId(invoice.getShiftId()).customerId(invoice.getCustomerId())
-                .returnOfId(invoice.getReturnOfId()).type(invoice.getType().name())
-                .totalAmount(invoice.getTotalAmount()).discountAmount(invoice.getDiscountAmount())
-                .finalAmount(invoice.getFinalAmount()).pointsUsed(invoice.getPointsUsed())
-                .pointsEarned(invoice.getPointsEarned()).note(invoice.getNote())
-                .createdAt(invoice.getCreatedAt()).items(items).payments(payments).build();
     }
 
     public record RefundItem(UUID productId, int quantity) {}

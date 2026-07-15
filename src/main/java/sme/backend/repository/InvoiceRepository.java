@@ -35,9 +35,15 @@ public interface InvoiceRepository extends JpaRepository<Invoice, UUID> {
         """)
     Optional<Invoice> findByIdWithDetails(@Param("id") UUID id);
 
+    // [FIX-A3] Lấy hoá đơn theo mã kèm theo items
+    @Query("""
+        SELECT DISTINCT i FROM Invoice i
+        LEFT JOIN FETCH i.items
+        WHERE i.code = :code
+        """)
+    Optional<Invoice> findByCodeWithDetails(@Param("code") String code);
+
     // [FIX-1] Lấy toàn bộ hóa đơn trả hàng đã được tạo từ một hóa đơn gốc
-    // Dùng để kiểm tra double refund: tổng số lượng đã trả của từng sản phẩm
-    // không được vượt quá số lượng trong hóa đơn gốc.
     List<Invoice> findByReturnOfId(UUID returnOfId);
 
     // [FIX-1] Lấy kèm items để tính tổng quantity đã hoàn trả — tránh N+1

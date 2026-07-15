@@ -1,4 +1,3 @@
-
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -6,11 +5,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import sme.backend.entity.*;
 import sme.backend.repository.NotificationRepository;
 import sme.backend.repository.ProductRepository;
 import sme.backend.repository.UserRepository;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -23,161 +24,187 @@ public class NotificationService {
     private final SimpMessagingTemplate messagingTemplate;
     private final NotificationRepository notificationRepository;
     private final ProductRepository productRepository;
-    private final UserRepository userRepository; // ĐÃ THÊM: để tìm Manager của một kho
+    private final UserRepository userRepository;
+
+    // ==============================================================================
+    // CORE: LƯU DATABASE VÀ PUSH REAL-TIME (TRUE REAL-TIME)
+    // ==============================================================================
+    
+    private void saveAndPushToWarehouse(UUID warehouseId, Notification notification) {
+        // 1. ĐÃ SỬA: Gắn ID chi nhánh và lưu Database
+        notification.setWarehouseId(warehouseId);
+        Notification saved = notificationRepository.save(notification);
+        
+        // 2. Push cho toàn bộ nhân viên trong chi nhánh (Kênh chung)
+        messagingTemplate.convertAndSend("/topic/warehouse/" + warehouseId + "/notifications", saved);
+        
+        // 3. Push cho Admin (Admin có kênh giám sát toàn cục)
+        messagingTemplate.convertAndSend("/topic/admin/notifications", saved);
+    }
+
+    private void saveAndPushToUser(UUID userId, Notification notification) {
+        notification.setUserId(userId);
+        Notification saved = notificationRepository.save(notification);
+        messagingTemplate.convertAndSendToUser(userId.toString(), "/queue/notifications", saved);
+    }
+
+    // ==============================================================================
+    // BUSINESS USE-CASES
+    // ==============================================================================
 
     @Async
     public void notifyLowStock(Inventory inventory) {
         if (inventory == null || inventory.getWarehouseId() == null) return;
 
-        String topic = "/topic/warehouse/" + inventory.getWarehouseId() + "/low-stock";
-
-        int minQty = inventory.getMinQuantity() != null ? inventory.getMinQuantity() : 0;
-        int currentQty = inventory.getQuantity() != null ? inventory.getQuantity() : 0;
-
         String productName = productRepository.findById(inventory.getProductId())
-                .map(Product::getName)
-                .orElse("Sản phẩm không xác định");
+                .map(Product::getName).orElse("Sản phẩm không xác định");
 
-        Map<String, Object> payload = Map.of(
-                "type",        "LOW_STOCK",
-                "productId",   inventory.getProductId(),
-                "warehouseId", inventory.getWarehouseId(),
-                "quantity",    currentQty,
-                "minQuantity", minQty,
-                "productName", productName
-        );
-        messagingTemplate.convertAndSend(topic, payload);
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("productId", inventory.getProductId());
+        payload.put("warehouseId", inventory.getWarehouseId());
+        payload.put("quantity", inventory.getQuantity() != null ? inventory.getQuantity() : 0);
+        payload.put("minQuantity", inventory.getMinQuantity() != null ? inventory.getMinQuantity() : 0);
+        payload.put("productName", productName);
 
         Notification notification = Notification.builder()
                 .type("LOW_STOCK")
                 .title("⚠️ Cảnh báo tồn kho thấp")
-                .message(String.format("Sản phẩm %s (ID: %s) tại kho %s chỉ còn %d sản phẩm",
-                        productName, inventory.getProductId(), inventory.getWarehouseId(), currentQty))
+                .message(String.format("Sản phẩm %s tại kho chỉ còn %d sản phẩm", productName, inventory.getQuantity()))
                 .payload(payload)
                 .build();
 
-        notificationRepository.save(notification);
-        log.debug("Low stock alert sent for product={}", inventory.getProductId());
+        saveAndPushToWarehouse(inventory.getWarehouseId(), notification);
     }
 
     @Async
     public void notifyNewOrder(Order order, UUID warehouseId) {
-        String topic = "/topic/warehouse/" + warehouseId + "/new-order";
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("orderId", order.getId());
+        payload.put("orderCode", order.getCode());
+        payload.put("amount", order.getFinalAmount() != null ? order.getFinalAmount() : 0);
+        payload.put("type_order", order.getType() != null ? order.getType().name() : "DELIVERY");
 
-        Map<String, Object> payload = Map.of(
-                "type",      "NEW_ORDER",
-                "orderId",   order.getId(),
-                "orderCode", order.getCode(),
-                "amount",    order.getFinalAmount() != null ? order.getFinalAmount() : 0,
-                "type_order", order.getType() != null ? order.getType().name() : "DELIVERY"
-        );
-        messagingTemplate.convertAndSend(topic, payload);
-        log.debug("New order notification sent: order={}", order.getCode());
+        Notification notification = Notification.builder()
+                .type("NEW_ORDER")
+                .title("🛒 Đơn hàng mới")
+                .message("Có đơn hàng mới #" + order.getCode() + " vừa được phân bổ về chi nhánh.")
+                .payload(payload)
+                .build();
+
+        saveAndPushToWarehouse(warehouseId, notification);
     }
 
     @Async
     public void notifyShiftClosed(Shift shift) {
-        String topic = "/topic/warehouse/" + shift.getWarehouseId() + "/shift-alert";
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("shiftId", shift.getId());
+        payload.put("cashierId", shift.getCashierId());
+        payload.put("discrepancyAmount", shift.getDiscrepancyAmount() != null ? shift.getDiscrepancyAmount() : 0);
 
-        Map<String, Object> payload = Map.of(
-                "type",              "SHIFT_PENDING_APPROVAL",
-                "shiftId",           shift.getId(),
-                "cashierId",         shift.getCashierId(),
-                "discrepancyAmount", shift.getDiscrepancyAmount() != null ? shift.getDiscrepancyAmount() : 0
-        );
+        Notification notification = Notification.builder()
+                .type("SHIFT_PENDING_APPROVAL")
+                .title("🕐 Ca làm việc chờ duyệt")
+                .message("Thu ngân vừa đóng ca. Vui lòng kiểm tra và duyệt chốt ca.")
+                .payload(payload)
+                .build();
 
-        messagingTemplate.convertAndSend(topic, payload);
-        log.debug("Shift closed notification sent: shift={}", shift.getId());
+        List<User> managers = userRepository.findByWarehouseIdAndRoleAndIsActiveTrue(
+                shift.getWarehouseId(), User.UserRole.ROLE_MANAGER);
+        for (User manager : managers) {
+            saveAndPushToUser(manager.getId(), notification);
+        }
     }
 
     @Async
     public void notifyTransferArrived(UUID transferId, UUID toWarehouseId) {
-        String topic = "/topic/warehouse/" + toWarehouseId + "/transfer";
-
-        Map<String, Object> payload = Map.of(
-                "type",       "TRANSFER_ARRIVED",
-                "transferId", transferId
-        );
-
-        messagingTemplate.convertAndSend(topic, payload);
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("transferId", transferId);
 
         Notification notification = Notification.builder()
                 .type("TRANSFER_ARRIVED")
-                .title("📦 Cập nhật trạng thái chuyển kho")
-                .message("Một phiếu chuyển kho liên quan đến chi nhánh của bạn vừa được cập nhật.")
+                .title("📦 Hàng luân chuyển đã đến")
+                .message("Một chuyến hàng luân chuyển vừa đến chi nhánh của bạn. Vui lòng kiểm đếm và nhận hàng.")
                 .payload(payload)
                 .build();
 
-        notificationRepository.save(notification);
+        saveAndPushToWarehouse(toWarehouseId, notification);
     }
 
-    /**
-     * ĐÃ THÊM: Báo cho (các) Manager của một chi nhánh khi Admin force-cancel một
-     * đơn hàng đang thuộc chi nhánh đó. Vì Admin không trực tiếp vận hành chi
-     * nhánh (xem triết lý phân quyền ở Module 2), Manager cần biết ngay để xử lý
-     * phần việc còn lại (báo khách, đối soát COD nếu có...).
-     */
     @Async
     public void notifyOrderForceCancelled(Order order, String reason) {
         if (order.getAssignedWarehouseId() == null) return;
-        String topic = "/topic/warehouse/" + order.getAssignedWarehouseId() + "/order-alert";
+        
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("orderId", order.getId());
+        payload.put("orderCode", order.getCode());
+        payload.put("reason", reason);
 
-        Map<String, Object> payload = Map.of(
-                "type",    "ORDER_FORCE_CANCELLED",
-                "orderId", order.getId(),
-                "orderCode", order.getCode(),
-                "reason",  reason
-        );
-        messagingTemplate.convertAndSend(topic, payload);
+        Notification notification = Notification.builder()
+                .type("ORDER_FORCE_CANCELLED")
+                .title("🚨 Admin hủy khẩn cấp đơn hàng")
+                .message("Đơn #" + order.getCode() + " đã bị Admin hủy khẩn cấp. Lý do: " + reason)
+                .payload(payload)
+                .build();
 
-        String message = "Đơn #" + order.getCode() + " đã bị Admin hủy khẩn cấp. Lý do: " + reason;
-        notifyManagersOfWarehouse(order.getAssignedWarehouseId(), "ORDER_FORCE_CANCELLED",
-                "🚨 Admin hủy khẩn cấp đơn hàng", message, payload);
-    }
-
-    /**
-     * ĐÃ THÊM: Báo cho Manager của chi nhánh MỚI khi Admin tái phân công một đơn
-     * hàng sang chi nhánh của họ - để họ biết và xác nhận lại đơn (đơn quay về
-     * PENDING sau khi tái phân công).
-     */
-    @Async
-    public void notifyOrderReassigned(Order order, UUID oldWarehouseId) {
-        if (order.getAssignedWarehouseId() == null) return;
-        String topic = "/topic/warehouse/" + order.getAssignedWarehouseId() + "/new-order";
-
-        Map<String, Object> payload = Map.of(
-                "type",      "ORDER_REASSIGNED",
-                "orderId",   order.getId(),
-                "orderCode", order.getCode(),
-                "fromWarehouseId", oldWarehouseId != null ? oldWarehouseId.toString() : ""
-        );
-        messagingTemplate.convertAndSend(topic, payload);
-
-        String message = "Đơn #" + order.getCode() + " vừa được Admin chuyển về chi nhánh của bạn. Vui lòng xác nhận lại đơn.";
-        notifyManagersOfWarehouse(order.getAssignedWarehouseId(), "ORDER_REASSIGNED",
-                "📦 Đơn hàng được tái phân công", message, payload);
-    }
-
-    private void notifyManagersOfWarehouse(UUID warehouseId, String type, String title,
-                                            String message, Map<String, Object> payload) {
         List<User> managers = userRepository.findByWarehouseIdAndRoleAndIsActiveTrue(
-                warehouseId, User.UserRole.ROLE_MANAGER);
+                order.getAssignedWarehouseId(), User.UserRole.ROLE_MANAGER);
         for (User manager : managers) {
-            notificationRepository.save(Notification.builder()
-                    .userId(manager.getId())
-                    .type(type)
-                    .title(title)
-                    .message(message)
-                    .payload(payload)
-                    .build());
+            saveAndPushToUser(manager.getId(), notification);
         }
     }
 
+    @Async
+    public void notifyOrderReassigned(Order order, UUID oldWarehouseId) {
+        if (order.getAssignedWarehouseId() == null) return;
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("orderId", order.getId());
+        payload.put("orderCode", order.getCode());
+        payload.put("fromWarehouseId", oldWarehouseId != null ? oldWarehouseId.toString() : "");
+
+        Notification notification = Notification.builder()
+                .type("ORDER_REASSIGNED")
+                .title("📦 Đơn hàng được tái phân công")
+                .message("Đơn #" + order.getCode() + " vừa được Admin chuyển về chi nhánh của bạn. Vui lòng kiểm tra.")
+                .payload(payload)
+                .build();
+
+        List<User> managers = userRepository.findByWarehouseIdAndRoleAndIsActiveTrue(
+                order.getAssignedWarehouseId(), User.UserRole.ROLE_MANAGER);
+        for (User manager : managers) {
+            saveAndPushToUser(manager.getId(), notification);
+        }
+    }
+
+    // ==============================================================================
+    // QUERIES & UPDATES
+    // ==============================================================================
+
+    @Transactional
     public void markAsRead(UUID notificationId) {
         notificationRepository.findById(notificationId).ifPresent(n -> {
             n.setIsRead(true);
             notificationRepository.save(n);
         });
+    }
+
+    @Transactional
+    public void markAllAsRead(UUID userId) {
+        List<Notification> unread = getUnread(userId);
+        for (Notification n : unread) {
+            n.setIsRead(true);
+        }
+        notificationRepository.saveAll(unread);
+    }
+
+    // ĐÃ THÊM: Đánh dấu đọc tất cả cho Manager
+    @Transactional
+    public void markAllAsReadForManager(UUID userId, UUID warehouseId) {
+        List<Notification> unread = getUnreadForManager(userId, warehouseId);
+        for (Notification n : unread) {
+            n.setIsRead(true);
+        }
+        notificationRepository.saveAll(unread);
     }
 
     public List<Notification> getUnread(UUID userId) {
@@ -187,10 +214,20 @@ public class NotificationService {
         return notificationRepository.findByUserIdAndIsReadFalseOrderByCreatedAtDesc(userId);
     }
 
+    // ĐÃ THÊM: Truy vấn danh sách riêng cho Manager
+    public List<Notification> getUnreadForManager(UUID userId, UUID warehouseId) {
+        return notificationRepository.findUnreadForManager(userId, warehouseId);
+    }
+
     public long countUnread(UUID userId) {
         if (userId == null) {
             return notificationRepository.countByUserIdIsNullAndIsReadFalse();
         }
         return notificationRepository.countByUserIdAndIsReadFalse(userId);
+    }
+
+    // ĐÃ THÊM: Số đếm riêng cho Manager
+    public long countUnreadForManager(UUID userId, UUID warehouseId) {
+        return notificationRepository.countUnreadForManager(userId, warehouseId);
     }
 }

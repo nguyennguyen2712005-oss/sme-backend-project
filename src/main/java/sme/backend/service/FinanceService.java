@@ -1,4 +1,3 @@
-
 package sme.backend.service;
 
 import lombok.RequiredArgsConstructor;
@@ -9,6 +8,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import sme.backend.dto.request.CreateCashbookEntryRequest;
 import sme.backend.dto.request.PaySupplierDebtRequest;
+import sme.backend.dto.response.OrderResponse;
 import sme.backend.dto.response.SupplierDebtResponse;
 import sme.backend.entity.*;
 import sme.backend.exception.BusinessException;
@@ -17,6 +17,7 @@ import sme.backend.repository.*;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -30,6 +31,8 @@ public class FinanceService {
     private final OrderRepository orderRepository;
     private final PurchaseOrderRepository purchaseOrderRepository;
     private final WarehouseRepository warehouseRepository;
+    private final OrderService orderService;
+    private final CustomerRepository customerRepository;
 
     @Transactional
     public CashbookTransaction createManualEntry(CreateCashbookEntryRequest req, String createdBy) {
@@ -138,20 +141,46 @@ public class FinanceService {
         return debt;
     }
 
+    // ĐÃ SỬA: Truyền các cờ (flags) boolean để vượt qua lỗi ép kiểu của Postgres
+    @Transactional(readOnly = true)
+    public Page<OrderResponse> getPendingCodOrders(UUID warehouseId, Instant from, Instant to,
+                                                    String keyword, Pageable pageable,
+                                                    User.UserRole requesterRole) {
+        String kw = (keyword == null) ? "" : keyword.trim();
+        
+        boolean hasWarehouse = warehouseId != null;
+        boolean hasFrom = from != null;
+        boolean hasTo = to != null;
+        boolean hasDateFilter = hasFrom || hasTo;
+
+        Page<Order> page = orderRepository.searchUnreconciledCOD(
+                hasWarehouse, warehouseId,
+                hasDateFilter,
+                hasFrom, from,
+                hasTo, to,
+                kw, pageable);
+                
+        return page.map(o -> orderService.mapToSimpleResponse(o, requesterRole));
+    }
+
     @Transactional
     public CodReconciliationResult reconcileCOD(List<CodReconciliationItem> items,
                                                 UUID warehouseId, String reconciledBy) {
         int matched = 0, notFound = 0;
         BigDecimal totalReceived = BigDecimal.ZERO;
         BigDecimal totalShippingFee = BigDecimal.ZERO;
+        
+        List<CodReconciliationItemResult> detailItems = new ArrayList<>();
+        List<String> notFoundCodes = new ArrayList<>();
 
         for (CodReconciliationItem item : items) {
             Order order = orderRepository.findByCode(item.orderCode()).orElse(null);
-            if (order == null) {
-                notFound++;
-                continue;
+            if (order == null) { 
+                notFound++; 
+                notFoundCodes.add(item.orderCode()); 
+                continue; 
             }
-
+            
             if (Boolean.TRUE.equals(order.getCodReconciled())) continue;
 
             order.setCodReconciled(true);
@@ -182,14 +211,27 @@ public class FinanceService {
                         .build());
             }
 
-            totalReceived   = totalReceived.add(item.amountReceived());
+            String customerName = "Khách lẻ";
+            if (order.getCustomerId() != null) {
+                var c = customerRepository.findById(order.getCustomerId()).orElse(null);
+                if (c != null) customerName = c.getFullName();
+            }
+
+            detailItems.add(new CodReconciliationItemResult(
+                    order.getCode(), customerName, item.amountReceived(),
+                    item.shippingFee(), item.shippingProvider(),
+                    item.amountReceived().subtract(item.shippingFee())));
+
+            totalReceived = totalReceived.add(item.amountReceived());
             totalShippingFee = totalShippingFee.add(item.shippingFee());
             matched++;
         }
 
-        return new CodReconciliationResult(matched, notFound,
-                totalReceived, totalShippingFee,
-                totalReceived.subtract(totalShippingFee));
+        BigDecimal netAmount = totalReceived.subtract(totalShippingFee);
+
+        return new CodReconciliationResult(
+                matched, notFound, totalReceived, totalShippingFee, 
+                netAmount, detailItems, notFoundCodes);
     }
 
     @Transactional(readOnly = true)
@@ -248,16 +290,12 @@ public class FinanceService {
         }).toList();
     }
     
-
-// ĐÃ SỬA: Tính tổng công nợ của một Nhà cung cấp (Có phân quyền theo kho)
     @Transactional(readOnly = true)
     public BigDecimal getTotalOutstandingBySupplier(UUID supplierId, UUID warehouseId) {
         BigDecimal total;
         if (warehouseId == null) {
-            // Dành cho Admin: Lấy tổng nợ toàn chuỗi
             total = supplierDebtRepository.getTotalOutstandingBySupplierId(supplierId);
         } else {
-            // Dành cho Manager: Lấy tổng nợ của riêng chi nhánh
             total = supplierDebtRepository.getTotalOutstandingBySupplierAndWarehouse(supplierId, warehouseId);
         }
         return total != null ? total : BigDecimal.ZERO;
@@ -277,11 +315,22 @@ public class FinanceService {
             String shippingProvider
     ) {}
 
-    public record CodReconciliationResult(
-            int matched,
-            int notFound,
-            BigDecimal totalReceived,
-            BigDecimal totalShippingFee,
+    public record CodReconciliationItemResult(
+            String orderCode, 
+            String customerName, 
+            BigDecimal amountReceived,
+            BigDecimal shippingFee, 
+            String shippingProvider, 
             BigDecimal netAmount
+    ) {}
+
+    public record CodReconciliationResult(
+            int matched, 
+            int notFound, 
+            BigDecimal totalReceived, 
+            BigDecimal totalShippingFee,
+            BigDecimal netAmount, 
+            List<CodReconciliationItemResult> items, 
+            List<String> notFoundCodes
     ) {}
 }

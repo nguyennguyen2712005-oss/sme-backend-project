@@ -1,4 +1,3 @@
-
 package sme.backend.controller;
 
 import jakarta.validation.Valid;
@@ -11,6 +10,8 @@ import org.springframework.web.bind.annotation.*;
 import sme.backend.dto.request.CreateCashbookEntryRequest;
 import sme.backend.dto.request.PaySupplierDebtRequest;
 import sme.backend.dto.response.ApiResponse;
+import sme.backend.dto.response.OrderResponse;
+import sme.backend.dto.response.PageResponse;
 import sme.backend.dto.response.SupplierDebtResponse;
 import sme.backend.entity.CashbookTransaction;
 import sme.backend.entity.SupplierDebt;
@@ -35,7 +36,6 @@ public class FinanceController {
 
     private final FinanceService financeService;
 
-    // ĐÃ THÊM YÊU CẦU 7: API lấy quỹ Toàn hệ thống
     @GetMapping("/cashbook/balance/total")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<BigDecimal>> getTotalFundBalance() {
@@ -44,7 +44,6 @@ public class FinanceController {
         return ResponseEntity.ok(ApiResponse.ok(cash.add(bank)));
     }
 
-    // Hàm tiện ích để đảm bảo Manager luôn chỉ truy cập được kho của họ
     private UUID getEffectiveWarehouseId(UserPrincipal principal, UUID requestedWarehouseId) {
         if (principal.getRole() == User.UserRole.ROLE_ADMIN) {
             return requestedWarehouseId;
@@ -84,7 +83,6 @@ public class FinanceController {
         )));
     }
     
-
     @GetMapping("/cashbook")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<List<CashbookTransaction>>> getCashbook(
@@ -117,9 +115,6 @@ public class FinanceController {
             @AuthenticationPrincipal UserPrincipal principal,
             @RequestParam(required = false) UUID warehouseId) {
         
-        // Dùng hàm tiện ích có sẵn để ép quyền:
-        // Admin sẽ lấy warehouseId từ params (nếu có) hoặc null (toàn chuỗi)
-        // Manager bị ép buộc phải lấy warehouseId của chính họ
         UUID wid = getEffectiveWarehouseId(principal, warehouseId);
         
         return ResponseEntity.ok(ApiResponse.ok(
@@ -133,6 +128,24 @@ public class FinanceController {
             @AuthenticationPrincipal UserPrincipal principal) {
         return ResponseEntity.ok(ApiResponse.ok("Thanh toán công nợ thành công",
                 financeService.paySupplierDebt(req, principal.getUsername())));
+    }
+
+    // ĐÃ SỬA: Thêm API lấy danh sách chờ đối soát với đầy đủ tham số
+    @GetMapping("/cod-reconciliation/pending")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<PageResponse<OrderResponse>>> getPendingCodOrders(
+            @AuthenticationPrincipal UserPrincipal principal,
+            @RequestParam(required = false) UUID warehouseId,
+            @RequestParam(required = false) Instant from,
+            @RequestParam(required = false) Instant to,
+            @RequestParam(required = false) String keyword,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size) {
+
+        Pageable pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "updatedAt"));
+        return ResponseEntity.ok(ApiResponse.ok(
+                PageResponse.of(financeService.getPendingCodOrders(
+                        warehouseId, from, to, keyword, pageable, principal.getRole()))));
     }
 
     @PostMapping("/cod-reconciliation")
