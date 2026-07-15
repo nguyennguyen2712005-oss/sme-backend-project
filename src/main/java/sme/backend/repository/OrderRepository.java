@@ -149,4 +149,5 @@ public interface OrderRepository extends JpaRepository<Order, UUID> {
                                         @Param("types") List<Order.OrderType> types,
                                         @Param("keyword") String keyword,
                                         Pageable pageable);
+    long countByStatus(Order.OrderStatus status);
 }

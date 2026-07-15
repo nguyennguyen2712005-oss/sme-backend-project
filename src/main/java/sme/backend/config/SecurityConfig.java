@@ -147,7 +147,7 @@ public class SecurityConfig {
 
                 // ── AI MODULE ────────────────────────────────────────────
                 .requestMatchers("/ai/**")
-                    .hasAnyRole("CASHIER", "MANAGER", "ADMIN")
+                    .hasAnyRole("MANAGER", "ADMIN")
 
                 // ── NOTIFICATIONS ────────────────────────────────────────
                 .requestMatchers("/notifications/**")

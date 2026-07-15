@@ -1,4 +1,3 @@
-
 package sme.backend.controller;
 
 import lombok.RequiredArgsConstructor;
@@ -24,23 +23,14 @@ public class AiController {
 
     private final AiService aiService;
 
-    /**
-     * POST /ai/chat — AI Co-pilot chat
-     * Body: { "message": "...", "conversationHistory": "..." }
-     * ĐÃ SỬA: mở cho CASHIER (trước đây chỉ MANAGER, ADMIN). Nhớ là
-     * SecurityConfig cũng phải mở /ai/** cho CASHIER song song - sửa 1 trong 2
-     * chỗ là không đủ, request sẽ bị chặn ở filter chain trước khi tới đây.
-     * Response cũng đổi từ { reply } sang { reply, sources } để hiển thị được
-     * nguồn tài liệu AI đã dùng.
-     */
     @PostMapping("/chat")
-    @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
+    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<Map<String, Object>>> chat(
             @RequestBody Map<String, String> body,
             @AuthenticationPrincipal UserPrincipal principal) {
 
         String message = body.get("message");
-        String history = body.get("conversationHistory");
+        String sessionIdRaw = body.get("sessionId");
 
         if (message == null || message.isBlank()) {
             return ResponseEntity.badRequest().body(
@@ -48,15 +38,47 @@ public class AiController {
                             .success(false).message("message bắt buộc").build());
         }
 
-        Map<String, Object> result = aiService.chat(message, principal.getId(), history);
+        UUID sessionId = null;
+        if (sessionIdRaw != null && !sessionIdRaw.isBlank()) {
+            try {
+                sessionId = UUID.fromString(sessionIdRaw);
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().body(
+                        ApiResponse.<Map<String, Object>>builder()
+                                .success(false).message("sessionId không hợp lệ").build());
+            }
+        }
+
+        Map<String, Object> result = aiService.chat(sessionId, message, principal);
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    /**
-     * GET /ai/suggested-questions — Câu hỏi gợi ý theo role (đọc role từ JWT)
-     */
+    @GetMapping("/sessions")
+    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listSessions(
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(aiService.listSessions(principal.getId())));
+    }
+
+    @GetMapping("/sessions/{sessionId}/messages")
+    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getSessionMessages(
+            @PathVariable UUID sessionId,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.ok(ApiResponse.ok(aiService.getSessionMessages(sessionId, principal.getId())));
+    }
+
+    @DeleteMapping("/sessions/{sessionId}")
+    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
+    public ResponseEntity<ApiResponse<Void>> deleteSession(
+            @PathVariable UUID sessionId,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        aiService.deleteSession(sessionId, principal.getId());
+        return ResponseEntity.ok(ApiResponse.ok("Đã xóa đoạn chat", null));
+    }
+
     @GetMapping("/suggested-questions")
-    @PreAuthorize("hasAnyRole('CASHIER','MANAGER','ADMIN')")
+    @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<List<String>>> getSuggestedQuestions(
             @AuthenticationPrincipal UserPrincipal principal) {
         return ResponseEntity.ok(ApiResponse.ok(aiService.getSuggestedQuestions(principal.getRole())));
@@ -81,10 +103,6 @@ public class AiController {
         return ResponseEntity.ok(ApiResponse.ok(aiService.getDocumentChunks(id)));
     }
 
-    /**
-     * POST /ai/documents — SYS-03: Upload tài liệu RAG
-     * Hỗ trợ: PDF, DOCX, PPTX, TXT
-     */
     @PostMapping("/documents")
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ApiResponse<Map<String, Object>>> uploadDocument(
@@ -109,9 +127,6 @@ public class AiController {
         )));
     }
 
-    /**
-     * GET /ai/search — Tìm kiếm ngữ nghĩa trong tài liệu
-     */
     @GetMapping("/search")
     @PreAuthorize("hasAnyRole('MANAGER','ADMIN')")
     public ResponseEntity<ApiResponse<?>> semanticSearch(
