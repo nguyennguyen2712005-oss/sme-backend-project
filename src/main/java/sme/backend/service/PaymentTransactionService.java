@@ -29,7 +29,6 @@ import java.util.UUID;
 public class PaymentTransactionService {
 
     private final PaymentTransactionRepository paymentTransactionRepository;
-    private final PayOSService payOSService;
     private final POSService posService;                
     private final ShiftService shiftService;
     private final CustomerRepository customerRepository;
@@ -60,7 +59,6 @@ public class PaymentTransactionService {
                     .orElseThrow(() -> new ResourceNotFoundException("Customer", req.getCustomerId()));
         }
 
-        // Tính tiền an toàn tại Server
         BigDecimal finalAmount = posService.previewFinalAmount(
                 req.getItems(), customer,
                 req.getPointsToUse() != null ? req.getPointsToUse() : 0,
@@ -71,14 +69,16 @@ public class PaymentTransactionService {
         }
 
         String code = codeGenerator.nextPaymentTxnCode();   
-        long payosOrderCode = System.currentTimeMillis();   
+        long mockOrderCode = System.currentTimeMillis();   
+        String gatewayOrderId = "DH" + mockOrderCode;
 
-        String description = "DH" + String.format("%06d", payosOrderCode % 1_000_000);
-        String returnUrl = frontendUrl + "/pos";
-        String cancelUrl = frontendUrl + "/pos";
-
-        var result = payOSService.createPaymentLink(
-                payosOrderCode, finalAmount.longValueExact(), description, returnUrl, cancelUrl);
+        // Dùng API tạo QR miễn phí (VietQR.io) với số tài khoản tùy ý
+        String BANK_ID = "MB"; // Tên viết tắt ngân hàng: MB, VCB, BIDV...
+        String BANK_ACCOUNT = "123456789"; // Số TK tùy ý
+        String ACCOUNT_NAME = "NGUYEN VAN A"; // Tên chủ thẻ
+        
+        String qrUrl = String.format("https://img.vietqr.io/image/%s-%s-compact2.jpg?amount=%d&addInfo=%s&accountName=%s", 
+                BANK_ID, BANK_ACCOUNT, finalAmount.longValueExact(), gatewayOrderId, ACCOUNT_NAME.replace(" ", "%20"));
 
         String cartSnapshotJson;
         try {
@@ -89,8 +89,8 @@ public class PaymentTransactionService {
 
         PaymentTransaction txn = PaymentTransaction.builder()
                 .code(code)
-                .payosOrderCode(payosOrderCode)
-                .payosPaymentLinkId(result.paymentLinkId())
+                .payosOrderCode(mockOrderCode) // Tận dụng lại cột cũ để khỏi lỗi DB
+                .payosPaymentLinkId("") // Tận dụng lại cột cũ
                 .shiftId(shift.getId())
                 .cashierId(cashierId)
                 .warehouseId(warehouseId)
@@ -98,13 +98,13 @@ public class PaymentTransactionService {
                 .amount(finalAmount)
                 .status(PaymentTransaction.Status.PENDING)
                 .cartSnapshot(cartSnapshotJson)
-                .qrCode(result.qrCode())
-                .checkoutUrl(result.checkoutUrl())
+                .qrCode(qrUrl) // Đưa thẳng link ảnh vào đây
+                .checkoutUrl(qrUrl)
                 .expiredAt(Instant.now().plus(EXPIRE_MINUTES, ChronoUnit.MINUTES))
                 .build();
         paymentTransactionRepository.save(txn);
 
-        log.info("Tạo QR thanh toán payOS: code={}, orderCode={}, amount={}", code, payosOrderCode, finalAmount);
+        log.info("Tạo QR Demo thành công: code={}, amount={}", code, finalAmount);
         return toResponse(txn);
     }
 
@@ -119,55 +119,14 @@ public class PaymentTransactionService {
         if (txn.getStatus() != PaymentTransaction.Status.PENDING) return;
         txn.setStatus(PaymentTransaction.Status.CANCELLED);
         paymentTransactionRepository.save(txn);
-        if (txn.getPayosPaymentLinkId() != null) {
-            payOSService.cancelPaymentLink(txn.getPayosPaymentLinkId(), "Cashier cancelled");
-        }
         pushWsUpdate(txn);
     }
 
+    // Webhook giờ không còn tác dụng vì ta xài nút bấm Demo ở Frontend.
+    // Cứ để nguyên method rỗng để lỡ endpoint /webhook có bị gọi cũng không văng lỗi.
     @Transactional
-    @SuppressWarnings("unchecked")
     public void handleWebhook(Map<String, Object> payload) {
-        try {
-            Object signatureObj = payload.get("signature");
-            Object dataObj = payload.get("data");
-            if (signatureObj == null || !(dataObj instanceof Map)) {
-                log.warn("Webhook payOS thiếu signature hoặc data, bỏ qua.");
-                return;
-            }
-            Map<String, Object> data = (Map<String, Object>) dataObj;
-
-            if (!payOSService.verifyWebhookSignature(data, String.valueOf(signatureObj))) {
-                log.warn("Webhook payOS có signature KHÔNG hợp lệ — bỏ qua. orderCode={}", data.get("orderCode"));
-                return;
-            }
-
-            Object orderCodeObj = data.get("orderCode");
-            if (orderCodeObj == null) return;
-            long orderCode = Long.parseLong(String.valueOf(orderCodeObj));
-
-            PaymentTransaction txn = paymentTransactionRepository.findByPayosOrderCode(orderCode).orElse(null);
-            if (txn == null) {
-                log.warn("Không tìm thấy PaymentTransaction cho orderCode={} từ webhook payOS", orderCode);
-                return;
-            }
-            if (txn.getStatus() == PaymentTransaction.Status.PAID) {
-                log.info("Webhook payOS trùng lặp cho giao dịch đã PAID: {}", txn.getCode());
-                return; 
-            }
-
-            txn.setStatus(PaymentTransaction.Status.PAID);
-            txn.setPaidAt(Instant.now());
-            Object referenceObj = data.get("reference");
-            if (referenceObj != null) txn.setReference(String.valueOf(referenceObj));
-            paymentTransactionRepository.save(txn);
-
-            log.info("Webhook payOS xác nhận PAID: code={}, orderCode={}", txn.getCode(), orderCode);
-            pushWsUpdate(txn);
-
-        } catch (Exception e) {
-            log.error("Lỗi xử lý webhook payOS: {}", e.getMessage(), e);
-        }
+        log.info("Chế độ Demo: Bỏ qua webhook.");
     }
 
     private void pushWsUpdate(PaymentTransaction txn) {
