@@ -423,14 +423,39 @@ public class OrderService {
         Order order = findOrderOrThrow(orderId);
         requireSameWarehouse(order, principal);
         order.transitionTo(Order.OrderStatus.DELIVERED, note, principal.getId().toString());
-        if ("COD".equals(order.getPaymentMethod())) {
-            order.setPaymentStatus(Order.PaymentStatus.PAID);
-            recordCODRevenue(order);
-        } else if ("BANK_TRANSFER".equals(order.getPaymentMethod())
+        
+        if ("BANK_TRANSFER".equals(order.getPaymentMethod())
                 && order.getPaymentStatus() == Order.PaymentStatus.UNPAID) {
             order.setPaymentStatus(Order.PaymentStatus.PAID);
             recordBankTransferRevenue(order, principal.getId().toString());
         }
+
+        // [SỬA LỖI TÍCH ĐIỂM] - Chỉ cộng điểm trên giá trị Tiền Hàng, KHÔNG cộng điểm cho Phí Ship
+        if (order.getCustomerId() != null) {
+            customerRepository.findById(order.getCustomerId()).ifPresent(customer -> {
+                // Tính số tiền hợp lệ để cộng điểm (Tổng khách trả - Phí ship)
+                BigDecimal shippingFee = order.getShippingFee() != null ? order.getShippingFee() : BigDecimal.ZERO;
+                BigDecimal eligibleAmountForPoints = order.getFinalAmount().subtract(shippingFee);
+
+                // Đảm bảo không bị âm (dù hiếm khi xảy ra)
+                if (eligibleAmountForPoints.compareTo(BigDecimal.ZERO) < 0) {
+                    eligibleAmountForPoints = BigDecimal.ZERO;
+                }
+
+                // Tính điểm dựa trên số tiền hợp lệ
+                int pointsEarned = eligibleAmountForPoints.divide(
+                        BigDecimal.valueOf(appProperties.getBusiness().getLoyaltyPointsPerVnd()),
+                        0, java.math.RoundingMode.DOWN).intValue();
+
+                customer.addPoints(pointsEarned);
+                
+                // Tổng chi tiêu (Hồ sơ khách hàng) thì vẫn ghi nhận toàn bộ số tiền khách đã rút ví ra trả
+                customer.setTotalSpent(customer.getTotalSpent().add(order.getFinalAmount()));
+                
+                customerRepository.save(customer);
+            });
+        }
+
         return mapToResponse(orderRepository.save(order), principal.getRole());
     }
 
@@ -442,17 +467,63 @@ public class OrderService {
         Order order = findOrderOrThrow(orderId);
         requireSameWarehouse(order, principal);
         order.transitionTo(Order.OrderStatus.RETURNED, reason, principal.getId().toString());
+
+        // 1. TÍNH TOÁN CÁC CON SỐ
+        BigDecimal shippingFee = order.getShippingFee() != null ? order.getShippingFee() : BigDecimal.ZERO;
         
-        // ĐÃ THÊM: Đánh dấu là đã hoàn tiền nếu đơn đã thanh toán trước đó
+        // [SỬA LỖI COMPILER] - Tính toán và gán giá trị 1 lần duy nhất để dùng được trong lambda
+        BigDecimal calculatedRefund = order.getFinalAmount().subtract(shippingFee);
+        final BigDecimal refundAmount = calculatedRefund.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : calculatedRefund;
+
+        // 2. HOÀN TIỀN VÀO SỔ QUỸ (NẾU ĐƠN ĐÃ THANH TOÁN)
         if (order.getPaymentStatus() == Order.PaymentStatus.PAID) {
             order.setPaymentStatus(Order.PaymentStatus.REFUNDED);
+
+            CashbookTransaction.FundType fundType = "BANK_TRANSFER".equals(order.getPaymentMethod()) 
+                    ? CashbookTransaction.FundType.BANK_112 
+                    : CashbookTransaction.FundType.CASH_111;
+
+            cashbookRepository.save(CashbookTransaction.builder()
+                    .warehouseId(order.getAssignedWarehouseId())
+                    .fundType(fundType)
+                    .transactionType(CashbookTransaction.TransactionType.OUT)
+                    .referenceType("SALE_ONLINE")
+                    .referenceId(order.getId())
+                    .amount(refundAmount) // Sổ quỹ CHỈ chi ra tiền hàng
+                    .description("Hoàn tiền đơn hàng bị khách trả lại #" + order.getCode() + " (Không hoàn phí ship)")
+                    .createdBy(principal.getId().toString())
+                    .build());
+        }
+
+        // 3. THU HỒI ĐIỂM & CHI TIÊU CỦA KHÁCH HÀNG (TRỪ SẠCH 100%)
+        if (order.getCustomerId() != null) {
+            customerRepository.findById(order.getCustomerId()).ifPresent(customer -> {
+                // A. Thu hồi Điểm (tính trên Tiền hàng)
+                int pointsToDeduct = refundAmount.divide(
+                        BigDecimal.valueOf(appProperties.getBusiness().getLoyaltyPointsPerVnd()),
+                        0, java.math.RoundingMode.DOWN).intValue();
+
+                if (customer.getLoyaltyPoints() >= pointsToDeduct) {
+                    customer.deductPoints(pointsToDeduct);
+                } else {
+                    customer.setLoyaltyPoints(0); 
+                }
+
+                // B. Thu hồi TỔNG CHI TIÊU 
+                BigDecimal newTotal = customer.getTotalSpent().subtract(order.getFinalAmount());
+                customer.setTotalSpent(newTotal.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : newTotal);
+
+                customerRepository.save(customer);
+            });
         }
         
+        // 4. HOÀN HÀNG VÀO TỒN KHO
         if (order.getAssignedWarehouseId() != null) {
             order.getItems().forEach(item -> inventoryService.returnToStock(
                     item.getProductId(), order.getAssignedWarehouseId(), item.getQuantity(),
                     orderId, "RETURNED_ORDER", principal.getId().toString()));
         }
+        
         return mapToResponse(orderRepository.save(order), principal.getRole());
     }
 
@@ -609,17 +680,6 @@ public class OrderService {
     // =====================================================================
     // REVENUE RECORDING
     // =====================================================================
-    private void recordCODRevenue(Order order) {
-        if (order.getAssignedWarehouseId() == null) return;
-        cashbookRepository.save(CashbookTransaction.builder()
-                .warehouseId(order.getAssignedWarehouseId())
-                .fundType(CashbookTransaction.FundType.CASH_111)
-                .transactionType(CashbookTransaction.TransactionType.IN)
-                .referenceType("SALE_ONLINE").referenceId(order.getId())
-                .amount(order.getFinalAmount())
-                .description("Thu COD đơn hàng #" + order.getCode())
-                .createdBy("SYSTEM").build());
-    }
 
     private void recordBankTransferRevenue(Order order, String changedBy) {
         if (order.getAssignedWarehouseId() == null) return;
@@ -688,8 +748,6 @@ public class OrderService {
             response.setTotalAmount(null);
             response.setShippingFee(null);
             response.setDiscountAmount(null);
-            response.setFinalAmount(null);
-            response.setPaymentMethod(null);
             response.setPaymentStatus(null);
         }
     }

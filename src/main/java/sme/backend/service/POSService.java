@@ -172,7 +172,7 @@ public class POSService {
     // ─────────────────────────────────────────────────────────
     // REFUND 
     // ─────────────────────────────────────────────────────────
-    @Transactional
+   @Transactional
     public InvoiceResponse refund(UUID originalInvoiceId, UUID shiftId,
                                   List<RefundItem> items, String returnDestination,
                                   UUID cashierId, UUID warehouseId, String note) {
@@ -200,10 +200,7 @@ public class POSService {
 
         for (RefundItem ri : items) {
             InvoiceItem originalItem = original.getItems().stream()
-                    .filter(i -> i.getProductId().equals(ri.productId()))
-                    .findFirst()
-                    .orElseThrow(() -> new BusinessException("PRODUCT_NOT_IN_INVOICE",
-                            "Sản phẩm không có trong hóa đơn gốc: " + ri.productId()));
+                    .filter(i -> i.getProductId().equals(ri.productId())).findFirst().orElseThrow();
             int alreadyReturned = alreadyReturnedQty.getOrDefault(ri.productId(), 0);
             int remaining = originalItem.getQuantity() - alreadyReturned;
             if (ri.quantity() <= 0) throw new BusinessException("INVALID_RETURN_QTY", "Số lượng hoàn phải > 0");
@@ -266,6 +263,32 @@ public class POSService {
                 .description("Trả hàng hóa đơn #" + original.getCode())
                 .createdBy(cashierId.toString()).build());
 
+        // =================================================================
+        // [SỬA LỖI COMPILER] Gán vào biến final để sử dụng an toàn trong Lambda
+        final BigDecimal finalTotalRefund = totalRefund;
+        // =================================================================
+
+        if (original.getCustomerId() != null) {
+            customerRepository.findById(original.getCustomerId()).ifPresent(customer -> {
+                // Sử dụng finalTotalRefund thay vì totalRefund
+                int pointsToDeduct = finalTotalRefund.divide(
+                        BigDecimal.valueOf(appProperties.getBusiness().getLoyaltyPointsPerVnd()),
+                        0, RoundingMode.DOWN).intValue();
+
+                // Trừ điểm (không để bị âm)
+                if (customer.getLoyaltyPoints() >= pointsToDeduct) {
+                    customer.deductPoints(pointsToDeduct);
+                } else {
+                    customer.setLoyaltyPoints(0);
+                }
+
+                // Giảm tổng chi tiêu
+                BigDecimal newTotal = customer.getTotalSpent().subtract(finalTotalRefund);
+                customer.setTotalSpent(newTotal.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : newTotal);
+
+                customerRepository.save(customer);
+            });
+        }
         log.info("Refund OK: return={}, original={}, amount={}",
                 returnInvoice.getCode(), original.getCode(), totalRefund);
         return buildInvoiceResponse(returnInvoice);
